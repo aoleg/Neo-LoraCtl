@@ -10,7 +10,7 @@ Effective per-key, per-step strength is a product: `user_strength × block_facto
 
 | Decision | Resolution |
 |---|---|
-| Mechanism | Per-key `add_patches(online_mode=True)` for scheduled LoRAs; per-step rewrite of patch-tuple strengths from an `on_cfg_denoiser` callback. No bypass injection, no Forge modification. |
+| Mechanism | `add_patches(online_mode=True)` for scheduled LoRAs, which routes each patch into an `OnlineLoRAPatch` object; per-step rewrite of those objects' patch tuples from an `on_cfg_denoiser` callback. No bypass injection, no Forge modification. Plan B if the patcher API churns again: activation-space injection via forward hooks (see krea-multi-lora notes in `knowledge_loractl.md`). |
 | Scope | Prompt-loaded LoRAs (`<lora:name:s>`), via interception of `networks.load_lora_for_models` with snapshot-diff to attribute patches to files. |
 | Filter | User-facing include/exclude list (name substrings, case-insensitive) with mode radio. Default: exclude `turbo, lightning, hyper, lcm, dmd`. |
 | Text encoder | Untouched by default (stock loader applies TE at prompt strength). Single on/off toggle; off = TE half at strength 0. |
@@ -24,8 +24,9 @@ Effective per-key, per-step strength is a product: `user_strength × block_facto
 
 ## Ground truth carried in from prior projects
 
-- Forge Neo API (commit `e1df9201`, 2026-08): patch tuples are 6 elements `(strength, adapter, strength_model, offset, function, online_flag)`; online patches live in `ModelPatcher.patches` (there is **no** `online_patches` dict — extensions built against the pre-2026-07 API are broken). `WeightPatch` re-reads `patches[key]` on every module forward with no caching, so per-step strength rewrites take effect immediately (`backend/patcher/base.py:90`, `backend/operations.py:76`).
-- Per-key online/baked exclusivity: a key with any online patch takes the `weight_function` path and is never merged, so mixing a scheduled LoRA with baked LoRAs on shared keys is correct by construction (`backend/patcher/base.py:550`).
+- **Target build: Forge Neo commit `92b55e1b` (2026-09-01, neo branch).** The patcher API changed again between `e1df9201` (2026-08) and this build — third layout in five months, see `knowledge_loractl.md` for the history. Current API: patch tuples are 5 elements `(strength, adapter, strength_model, offset, function)`; `add_patches(..., online_mode=True)` does not touch `self.patches` at all — each online patch becomes an `OnlineLoRAPatch(key, tuple)` object appended to `ModelPatcher.weight_wrapper_patches[key]` (`backend/patcher/base.py:100,417`). At load, these extend every affected module's `weight_function` list (`base.py:589-593`), and `get_weight_and_bias` applies them on **every** forward, both manual-cast and plain paths, on a cloned weight (`backend/operations.py:76-90,228`).
+- Per-step scheduling therefore rewrites `OnlineLoRAPatch.patch[0] = (new_strength, adapter, sm, offset, fn)` on objects we own — `merge_lora_to_weight` re-reads the object's list per forward, no caching. Attribution is a snapshot-diff of `weight_wrapper_patches` around the intercepted stock-loader call. `add_patches` still bumps `patches_uuid`, so a fresh load installs the wrappers.
+- Online and baked application can now coexist on one key (wrappers stack on top of merged weights); a LoRA loaded with `online_mode=True` is exclusively online by construction (its tuples never enter `patches`). Memory reservation follows the wrapper dict (`backend/sampling/sampling_function.py:377`).
 - `current_lora_hash` must be nulled whenever our config changes, or Forge reuses the previous LoRA application (pattern from lora-block-weight-neo).
 - On Forge Neo, Flux-family schedules run a **fixed** shift (Krea 2: `mu = 1.15`, effective 3.158, resolution-independent; `use_shift` is false for Krea) — so sigma-anchored zones transfer across step counts and resolutions (`knowledge_speed.md` §11, `knowledge_sigmas.md` §5.4).
 - Default composition/detail boundary: sigma ≈ 0.90 for Krea 2 (SPEED calibration; Flux measured "perfect" at ≥ 0.9249 on Forge Neo). The CHARACTER/DETAIL boundary is provisional (≈ 0.5) until phase 3.
@@ -75,6 +76,6 @@ Exit criteria: none hard; defaults promoted as data accumulates.
 
 ## Cross-phase rules
 
-- Source projects (`ComfyUI-SigmaSync-LoRA`, `lora-block-weight-neo`, `ComfyUI-SPEED`, `sd-webui-forge-classic`) are read-only references.
+- Source projects (`ComfyUI-SigmaSync-LoRA`, `lora-block-weight-neo`, `krea-multi-lora`, `ComfyUI-SPEED`, `sd-webui-forge-classic`) are read-only references.
 - Every phase ends with a `knowledge_loractl.md` update and a commit.
-- Pin and record the Forge Neo commit developed against; patch-tuple internals have churned once already (2026-07) and will again.
+- Pin and record the Forge Neo commit developed against; patch internals have churned twice already (2026-07, 2026-08) and will again. The offline harness must assert the live API shape (tuple arity, `weight_wrapper_patches` presence) so drift fails loudly, not silently.
