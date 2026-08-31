@@ -1,0 +1,344 @@
+"""Framework-agnostic core for Neo-LoraCtl.
+
+Pure stdlib on purpose: no torch, no gradio, no Forge imports. The Forge
+script (scripts/neo_loractl.py) owns all webui/backend interaction and calls
+into this module for everything that can be tested offline: preset masks,
+sigma curves, key classification, LoRA filtering, and per-step strength
+rewriting of OnlineLoRAPatch-style objects.
+
+Target build: sd-webui-forge-classic, neo branch, commit 92b55e1b.
+Patch tuples are 5 elements (strength, adapter, strength_model, offset,
+function); online patches are OnlineLoRAPatch objects held in
+ModelPatcher.weight_wrapper_patches[key], each carrying its tuple in a
+1-element list `obj.patch`. See docs/PLAN.md and knowledge_loractl.md.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass, field
+
+
+PATCH_TUPLE_LEN = 5
+
+BLOCK_PRESETS = ("FULL", "COMPOSITION", "CHARACTER", "STYLE")
+TIME_PRESETS = ("FLAT", "COMPOSITION", "CHARACTER", "DETAIL")
+MODIFIERS = ("Emphasize", "Suppress")
+
+# Provisional Krea 2 defaults (normalized sigma). The COMPOSITION/rest
+# boundary comes from the SPEED calibration (knowledge_speed.md §11); the
+# CHARACTER/DETAIL boundary is a guess until phase 3.
+DEFAULT_TIME_HI_BOUNDARY = 0.90
+DEFAULT_TIME_LO_BOUNDARY = 0.50
+DEFAULT_TIME_TRANSITION = 0.06
+
+# Smoothstep shoulder width on the block axis, in blocks. Not user-exposed.
+DEFAULT_BLOCK_SHOULDER = 2.5
+
+DEFAULT_EXCLUDE_PATTERNS = "turbo, lightning, hyper, lcm, dmd"
+
+
+# ---------------------------------------------------------------------------
+# API-shape validation (the guard against Forge patcher churn)
+# ---------------------------------------------------------------------------
+
+def validate_patch_object(obj) -> str | None:
+    """Return an error string if obj does not look like an OnlineLoRAPatch
+    from the pinned build, else None."""
+    patch = getattr(obj, "patch", None)
+    if not isinstance(patch, list) or len(patch) < 1:
+        return f"patch object has no 1+-element .patch list: {type(obj).__name__}"
+    entry = patch[0]
+    if not isinstance(entry, tuple) or len(entry) != PATCH_TUPLE_LEN:
+        got = len(entry) if isinstance(entry, tuple) else type(entry).__name__
+        return f"patch tuple arity mismatch: expected {PATCH_TUPLE_LEN}, got {got}"
+    if not isinstance(entry[0], (int, float)):
+        return f"patch tuple strength is not a number: {type(entry[0]).__name__}"
+    if not callable(obj):
+        return f"patch object is not callable: {type(obj).__name__}"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Smooth window primitives
+# ---------------------------------------------------------------------------
+
+def _smoothstep(t: float) -> float:
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _rise(x: float, edge: float, width: float) -> float:
+    """0 -> 1 smoothstep ramp straddling `edge` (0.5 exactly at the edge)."""
+    if width <= 0.0:
+        return 1.0 if x >= edge else 0.0
+    return _smoothstep((x - (edge - width / 2.0)) / width)
+
+
+def _window(x: float, lo: float | None, hi: float | None, width: float) -> float:
+    """Smooth membership of x in [lo, hi]; None means the zone extends to the
+    domain edge on that side. Adjacent zones with shared boundaries and equal
+    widths sum to 1 everywhere."""
+    w = 1.0
+    if lo is not None:
+        w *= _rise(x, lo, width)
+    if hi is not None:
+        w *= 1.0 - _rise(x, hi, width)
+    return w
+
+
+def _apply_modifier(w: float, modifier: str, contrast: float) -> float:
+    """Map zone membership w to a strength factor in [1 - contrast, 1]."""
+    c = min(max(contrast, 0.0), 1.0)
+    if modifier == "Suppress":
+        return 1.0 - c * w
+    return 1.0 - c * (1.0 - w)  # Emphasize
+
+
+# ---------------------------------------------------------------------------
+# Block axis
+# ---------------------------------------------------------------------------
+
+def block_zone(preset: str, count: int) -> tuple[float | None, float | None]:
+    """Zone boundaries in block-index space (even thirds)."""
+    third = count / 3.0
+    if preset == "COMPOSITION":
+        return None, third
+    if preset == "CHARACTER":
+        return third, 2.0 * third
+    if preset == "STYLE":
+        return 2.0 * third, None
+    raise ValueError(f"unknown block preset: {preset}")
+
+
+def build_block_mask(count: int, preset: str, modifier: str, contrast: float,
+                     shoulder: float = DEFAULT_BLOCK_SHOULDER) -> list[float]:
+    """Per-block factor, evaluated at block centers (index + 0.5)."""
+    if count < 1:
+        raise ValueError("block count must be >= 1")
+    if preset == "FULL" or contrast <= 0.0:
+        return [1.0] * count
+    lo, hi = block_zone(preset, count)
+    return [
+        _apply_modifier(_window(i + 0.5, lo, hi, shoulder), modifier, contrast)
+        for i in range(count)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Key classification
+# ---------------------------------------------------------------------------
+
+_MODEL_PREFIX = "diffusion_model."
+
+# Krea 2 (SingleStreamDiT) module prefixes that are NOT part of the 28-block
+# stack; explicit so txtfusion.layerwise_blocks/refiner_blocks can never be
+# misread as DiT blocks.
+_FLAT_NON_BLOCK_PREFIXES = ("txtfusion.", "first", "last.", "tmlp.", "txtmlp.", "tproj.", "pe_embedder")
+
+_RE_FLAT_BLOCK = re.compile(r"^blocks\.(\d+)\.")
+_RE_FLUX_DOUBLE = re.compile(r"^double_blocks\.(\d+)\.")
+_RE_FLUX_SINGLE = re.compile(r"^single_blocks\.(\d+)\.")
+_RE_SD_INPUT = re.compile(r"^input_blocks\.(\d+)\.")
+_RE_SD_MIDDLE = re.compile(r"^middle_block\.")
+_RE_SD_OUTPUT = re.compile(r"^output_blocks\.(\d+)\.")
+
+ARCH_FLAT = "flat"      # Krea 2, Anima, Wan-style flat DiT stacks
+ARCH_FLUX = "flux"      # double/single stream
+ARCH_SD = "sd"          # UNet in/mid/out (26-slot convention)
+ARCH_UNKNOWN = "unknown"
+
+
+def _strip_prefix(key: str) -> str:
+    return key[len(_MODEL_PREFIX):] if key.startswith(_MODEL_PREFIX) else key
+
+
+def detect_arch(keys) -> str:
+    for key in keys:
+        k = _strip_prefix(key)
+        if _RE_FLUX_DOUBLE.match(k) or _RE_FLUX_SINGLE.match(k):
+            return ARCH_FLUX
+        if _RE_SD_INPUT.match(k) or _RE_SD_OUTPUT.match(k):
+            return ARCH_SD
+        if _RE_FLAT_BLOCK.match(k):
+            return ARCH_FLAT
+    return ARCH_UNKNOWN
+
+
+def classify_key(key: str, arch: str, num_double: int = 0) -> int | None:
+    """Map a patch key (model state-dict key) to its block index, or None for
+    the non-block bucket (factor fixed at 1.0)."""
+    k = _strip_prefix(key)
+    if arch == ARCH_FLAT:
+        if k.startswith(_FLAT_NON_BLOCK_PREFIXES):
+            return None
+        m = _RE_FLAT_BLOCK.match(k)
+        return int(m.group(1)) if m else None
+    if arch == ARCH_FLUX:
+        m = _RE_FLUX_DOUBLE.match(k)
+        if m:
+            return int(m.group(1))
+        m = _RE_FLUX_SINGLE.match(k)
+        if m:
+            return int(m.group(1)) + num_double
+        return None
+    if arch == ARCH_SD:
+        m = _RE_SD_INPUT.match(k)
+        if m:
+            return int(m.group(1)) + 1
+        if _RE_SD_MIDDLE.match(k):
+            return 13
+        m = _RE_SD_OUTPUT.match(k)
+        if m:
+            return int(m.group(1)) + 14
+        return 0  # BASE slot in the 26-block convention
+    return None
+
+
+def infer_block_layout(keys, arch: str) -> tuple[int, int]:
+    """(block_count, num_double) inferred from patch keys. For the SD family
+    the count is the 26-slot convention. Prefer model introspection in the
+    script (len(dm.blocks)); this is the offline/LoRA-side fallback."""
+    if arch == ARCH_SD:
+        return 26, 0
+    d_max = s_max = flat_max = -1
+    for key in keys:
+        k = _strip_prefix(key)
+        if arch == ARCH_FLUX:
+            m = _RE_FLUX_DOUBLE.match(k)
+            if m:
+                d_max = max(d_max, int(m.group(1)))
+            m = _RE_FLUX_SINGLE.match(k)
+            if m:
+                s_max = max(s_max, int(m.group(1)))
+        elif arch == ARCH_FLAT:
+            if k.startswith(_FLAT_NON_BLOCK_PREFIXES):
+                continue
+            m = _RE_FLAT_BLOCK.match(k)
+            if m:
+                flat_max = max(flat_max, int(m.group(1)))
+    if arch == ARCH_FLUX:
+        return d_max + 1 + s_max + 1, d_max + 1
+    return flat_max + 1, 0
+
+
+# ---------------------------------------------------------------------------
+# Time axis
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TimeCurve:
+    preset: str = "FLAT"
+    modifier: str = "Emphasize"
+    contrast: float = 0.0
+    hi_boundary: float = DEFAULT_TIME_HI_BOUNDARY
+    lo_boundary: float = DEFAULT_TIME_LO_BOUNDARY
+    transition: float = DEFAULT_TIME_TRANSITION
+
+    def zone(self) -> tuple[float | None, float | None]:
+        if self.preset == "COMPOSITION":
+            return self.hi_boundary, None
+        if self.preset == "CHARACTER":
+            return self.lo_boundary, self.hi_boundary
+        if self.preset == "DETAIL":
+            return None, self.lo_boundary
+        raise ValueError(f"unknown time preset: {self.preset}")
+
+    def factor(self, sigma_norm: float) -> float:
+        """Strength factor at a normalized sigma (sigma / full-schedule
+        sigma[0]); high sigma = early in the run."""
+        if self.preset == "FLAT" or self.contrast <= 0.0:
+            return 1.0
+        lo, hi = self.zone()
+        w = _window(sigma_norm, lo, hi, self.transition)
+        return _apply_modifier(w, self.modifier, self.contrast)
+
+
+def normalize_sigma(sigma: float, schedule_sigma0: float) -> float:
+    """Normalize by the FULL schedule's first sigma so the same boundaries
+    work on flow models (sigma0 == 1.0, identity) and epsilon models
+    (sigma0 ~ 14.6). img2img/hires start mid-schedule and land mid-curve."""
+    if schedule_sigma0 <= 0.0:
+        return sigma
+    return sigma / schedule_sigma0
+
+
+# ---------------------------------------------------------------------------
+# LoRA include/exclude filter
+# ---------------------------------------------------------------------------
+
+def parse_patterns(text: str) -> list[str]:
+    return [p.strip().lower() for p in (text or "").split(",") if p.strip()]
+
+
+def lora_is_scheduled(filename: str, patterns: list[str], mode: str) -> bool:
+    """mode 'exclude': schedule unless a pattern matches the basename.
+    mode 'include': schedule only if a pattern matches (empty list -> none)."""
+    base = os.path.splitext(os.path.basename(filename))[0].lower()
+    matched = any(p in base for p in patterns)
+    if mode == "include":
+        return matched
+    return not matched
+
+
+# ---------------------------------------------------------------------------
+# Per-step scheduling of OnlineLoRAPatch objects
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ScheduledEntry:
+    obj: object          # OnlineLoRAPatch-like: .patch = [5-tuple]
+    base_strength: float
+    block_factor: float
+
+
+@dataclass
+class ScheduleSet:
+    entries: list[ScheduledEntry] = field(default_factory=list)
+    last_factor: float | None = None
+
+    @staticmethod
+    def snapshot_counts(wrapper_patches: dict) -> dict[str, int]:
+        return {key: len(objs) for key, objs in wrapper_patches.items()}
+
+    def collect(self, before_counts: dict[str, int], wrapper_patches: dict,
+                block_factor_for_key) -> list[str]:
+        """Adopt every OnlineLoRAPatch added since `before_counts` was taken.
+        Returns a list of error strings (empty on success); on any error no
+        entry from this collection round is adopted."""
+        errors = []
+        adopted = []
+        for key, objs in wrapper_patches.items():
+            for obj in objs[before_counts.get(key, 0):]:
+                err = validate_patch_object(obj)
+                if err is not None:
+                    errors.append(f"{key}: {err}")
+                    continue
+                adopted.append(ScheduledEntry(
+                    obj=obj,
+                    base_strength=float(obj.patch[0][0]),
+                    block_factor=float(block_factor_for_key(key)),
+                ))
+        if errors:
+            return errors
+        self.entries.extend(adopted)
+        self.last_factor = None
+        return []
+
+    def apply_time_factor(self, time_factor: float) -> None:
+        """Rewrite every owned patch tuple's strength to
+        base * block_factor * time_factor. Cheap no-op if unchanged."""
+        if self.last_factor is not None and time_factor == self.last_factor:
+            return
+        self.last_factor = time_factor
+        for e in self.entries:
+            t = e.obj.patch[0]
+            e.obj.patch[0] = (e.base_strength * e.block_factor * time_factor,) + t[1:]
+
+    def clear(self) -> None:
+        self.entries.clear()
+        self.last_factor = None
