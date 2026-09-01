@@ -533,7 +533,7 @@ class TestEmphasizeRedistribution(unittest.TestCase):
         prepared, the mean applied factor over all model-call steps is 1."""
         h = Harness()
         _, per_step = h.generate(["charA.safetensors"], strengths=[0.5],
-                                 ui={"time_preset": "CHARACTER",
+                                 ui={"time_preset": "MIDRANGE",
                                      "time_contrast": 0.5})
         name = "diffusion_model.blocks.20.mlp.0.weight#0"
         factors = [step[name] / 0.5 for step in per_step]
@@ -544,11 +544,11 @@ class TestEmphasizeRedistribution(unittest.TestCase):
     def test_boost_deepens_the_bell(self):
         h1 = Harness()
         _, per1 = h1.generate(["charA.safetensors"], strengths=[0.5],
-                              ui={"time_preset": "CHARACTER", "time_contrast": 0.5,
+                              ui={"time_preset": "MIDRANGE", "time_contrast": 0.5,
                                   "time_boost": 0.5})
         h2 = Harness()
         _, per2 = h2.generate(["charA.safetensors"], strengths=[0.5],
-                              ui={"time_preset": "CHARACTER", "time_contrast": 0.5,
+                              ui={"time_preset": "MIDRANGE", "time_contrast": 0.5,
                                   "time_boost": 2.0})
         name = "diffusion_model.blocks.20.mlp.0.weight#0"
         self.assertLess(max(s[name] for s in per1), max(s[name] for s in per2))

@@ -225,15 +225,15 @@ class TestTimeCurve(unittest.TestCase):
         self.assertAlmostEqual(curve.factor(0.50), 0.5, places=6)
         self.assertAlmostEqual(curve.factor(0.95), 0.0, places=6)
 
-    def test_character_isolate_is_interior(self):
-        curve = core.TimeCurve("CHARACTER", "Isolate", 1.0)
+    def test_midrange_isolate_is_interior(self):
+        curve = core.TimeCurve("MIDRANGE", "Isolate", 1.0)
         self.assertAlmostEqual(curve.factor(0.70), 1.0, places=6)
         self.assertAlmostEqual(curve.factor(1.0), 0.0, places=6)
         self.assertAlmostEqual(curve.factor(0.10), 0.0, places=6)
 
     def test_suppress_mirrors_isolate(self):
-        i = core.TimeCurve("CHARACTER", "Isolate", 0.6)
-        s = core.TimeCurve("CHARACTER", "Suppress", 0.6)
+        i = core.TimeCurve("MIDRANGE", "Isolate", 0.6)
+        s = core.TimeCurve("MIDRANGE", "Suppress", 0.6)
         for sig in (0.0, 0.3, 0.5, 0.7, 0.9, 1.0):
             self.assertAlmostEqual(i.factor(sig) + s.factor(sig), 2.0 - 0.6, places=6)
 
@@ -241,13 +241,13 @@ class TestTimeCurve(unittest.TestCase):
         """COMPOSITION + CHARACTER + DETAIL windows sum to 1 at every sigma
         (same boundaries and transition width), so Isolate presets tile the
         run without gaps or double coverage."""
-        curves = [core.TimeCurve(p, "Isolate", 1.0) for p in ("COMPOSITION", "CHARACTER", "DETAIL")]
+        curves = [core.TimeCurve(p, "Isolate", 1.0) for p in ("COMPOSITION", "MIDRANGE", "DETAIL")]
         for sig in (0.05, 0.35, 0.5, 0.62, 0.88, 0.9, 0.93, 1.0):
             total = sum(c.factor(sig) for c in curves)
             self.assertAlmostEqual(total, 1.0, places=6, msg=f"sigma={sig}")
 
     def test_one_sided_bounds(self):
-        for preset in ("COMPOSITION", "CHARACTER", "DETAIL"):
+        for preset in ("COMPOSITION", "MIDRANGE", "DETAIL"):
             for modifier in ("Suppress", "Isolate"):
                 curve = core.TimeCurve(preset, modifier, 0.7)
                 for sig in (0.0, 0.2, 0.5, 0.9, 1.0):
@@ -258,7 +258,7 @@ class TestTimeCurve(unittest.TestCase):
     def test_emphasize_prepared_mean_is_one(self):
         """Step-weighted budget conservation on the real Krea 12-step
         schedule: mean factor over the model-call steps == 1 exactly."""
-        for preset in ("COMPOSITION", "CHARACTER", "DETAIL"):
+        for preset in ("COMPOSITION", "MIDRANGE", "DETAIL"):
             for boost in (0.5, 1.0, 1.5):
                 curve = core.TimeCurve(preset, "Emphasize", 0.5, boost=boost)
                 curve.prepare(self.KREA_STEPS)
@@ -274,7 +274,7 @@ class TestTimeCurve(unittest.TestCase):
         self.assertGreater(curve.factor(0.25), 0.5)      # but shallow floor
 
     def test_emphasize_unprepared_falls_back(self):
-        curve = core.TimeCurve("CHARACTER", "Emphasize", 0.5)
+        curve = core.TimeCurve("MIDRANGE", "Emphasize", 0.5)
         f = curve.factor(0.7)  # lazily computes a uniform-grid zone mean
         self.assertGreater(f, 1.0)
         self.assertIsNotNone(curve.zone_mean)

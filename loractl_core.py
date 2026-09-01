@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 PATCH_TUPLE_LEN = 5
 
 BLOCK_PRESETS = ("FULL", "COMPOSITION", "CHARACTER", "STYLE")
-TIME_PRESETS = ("FLAT", "COMPOSITION", "CHARACTER", "DETAIL")
+TIME_PRESETS = ("FLAT", "COMPOSITION", "MIDRANGE", "DETAIL")
 
 # Emphasize: mean-preserving redistribution — boosts the zone above the
 # prompt strength and lowers the rest so the average stays exactly 1.
@@ -280,7 +280,7 @@ class TimeCurve:
     def zone(self) -> tuple[float | None, float | None]:
         if self.preset == "COMPOSITION":
             return self.hi_boundary, None
-        if self.preset == "CHARACTER":
+        if self.preset == "MIDRANGE":
             return self.lo_boundary, self.hi_boundary
         if self.preset == "DETAIL":
             return None, self.lo_boundary

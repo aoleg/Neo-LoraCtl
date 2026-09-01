@@ -1,78 +1,97 @@
 # Neo-LoraCtl
 
-Fine-grained LoRA control for **Stable Diffusion WebUI Forge Neo**: decide **where** in the model (blocks) and **when** in the sampling run (timesteps) your prompt's `<lora:...>` networks apply — with simple presets instead of number grids.
+Fine control over where and when your LoRAs act, for Stable Diffusion WebUI Forge Neo.
 
-Built for **Krea 2** first, where character LoRAs often drag in unwanted style and style LoRAs distort characters. SD 1.5 / SDXL and Flux checkpoints are supported on a best-effort basis; unknown architectures fall back gracefully (timestep control still works, block control switches off).
+A LoRA rarely does just one thing. A character LoRA carries the face you want, and along with it the rendering style, the grain and the color cast of its training set. A style LoRA carries the look you want, and along with it distorted faces. The usual fix is lowering the LoRA strength, and it fails: turn the strength down far enough to remove the unwanted part and the part you wanted is gone too.
 
-## Status
+Neo-LoraCtl takes a different approach. Instead of one strength for the whole LoRA, it shapes the strength across two dimensions: across the model's blocks (which parts of the image generation the LoRA is allowed to influence) and across the sampling steps (when during generation it applies). You pick a preset on either axis, choose whether to emphasize or suppress that zone, and set how strongly. No number grids, no per-block spreadsheets.
 
-In development. The mechanism is fully built and offline-tested; live calibration of the preset defaults on Krea 2 is ongoing. Treat preset boundaries as provisional.
+Built and calibrated for Krea 2 first. SD 1.5, SDXL and Flux checkpoints are supported on a best effort basis. Unknown architectures degrade gracefully: timestep control keeps working, block control switches off.
+
+![Likeness comparison](img/likeness.png)
+
+Here is the problem and the solution in one strip. Left: a character LoRA at full strength gives a good likeness, together with everything else it drags in. Right: the usual fix, lowering the LoRA to 0.5, loses the face entirely. Middle: Neo-LoraCtl with blocks CHARACTER + Emphasize keeps the LoRA at full strength where the identity lives and trims it elsewhere. The likeness is as good as at full strength, arguably better.
 
 ## Installation
 
 Copy or clone this folder into `extensions/` inside your Forge Neo install and restart the UI. No extra Python packages are needed.
 
-## Usage
+## Quick start
 
-Add LoRAs to your prompt as usual (`<lora:my_character:0.8>`), open the **Neo-LoraCtl** accordion, tick **Enable**, and pick a preset on either axis (or both).
+Add LoRAs to your prompt as usual, for example `<lora:my_character:1>`. Open the Neo-LoraCtl accordion, tick Enable, and pick a preset on either axis or both.
 
-### Blocks — what the LoRA is allowed to shape
+If you want one recipe to start with: for a character LoRA that bleeds style into your images, set Blocks to `CHARACTER`, Modifier to `Emphasize`, Contrast to 0.5, and leave the Timesteps at `FLAT`. This is the combination in the middle panel above.
 
-| Preset | Focus |
+## Blocks: where in the model the LoRA acts
+
+| Preset | What lives there |
 |---|---|
-| `FULL` | No block filtering (default). |
-| `COMPOSITION` | Early blocks: layout, poses, macro geometry. |
-| `CHARACTER` | Middle blocks: subject identity, faces, concepts. |
-| `STYLE` | Late blocks: textures, coloring, lighting, rendering style. |
+| `FULL` | No block shaping (default). |
+| `COMPOSITION` | Early blocks: layout, poses, large scale geometry. |
+| `CHARACTER` | Middle blocks: subject identity, faces. |
+| `STYLE` | Late blocks: textures, grain, coloring, rendering style. |
 
-### Timesteps — when in the run the LoRA applies
+These zone names are backed by testing, on Krea 2 with character LoRAs. Emphasizing CHARACTER visibly strengthens identity. Emphasizing STYLE makes the LoRA's texture fingerprint plainly visible, which is exactly what you would suppress it for:
 
-| Preset | Focus |
+![Style noise comparison](img/style_noise.png)
+
+Look at the skin. Left: the LoRA at full strength carries some of its training grain. Middle: emphasizing the STYLE blocks amplifies that grain until you cannot miss it. Right: suppressing the STYLE blocks removes it, and the skin renders cleaner than at full strength. Same seed, same prompt in all three.
+
+## Timesteps: when during the run the LoRA acts
+
+| Preset | What happens then |
 |---|---|
 | `FLAT` | No time scheduling (default). |
-| `COMPOSITION` | Early steps (high sigma), where the image layout forms. |
-| `CHARACTER` | Middle steps, where subjects take shape. |
-| `DETAIL` | Late steps, where fine detail and style are rendered. |
+| `COMPOSITION` | Early steps, where the image layout and the subject's identity form. |
+| `MIDRANGE` | The middle stretch of the run. |
+| `DETAIL` | Late steps, where fine detail and surface rendering form. |
 
-### Modifier, Contrast, and Boost
+One thing our testing made very clear: on short schedules such as Krea 2 Turbo, faces form in the early steps. If you want to protect a character, the timestep preset that helps is `COMPOSITION`, and by the MIDRANGE steps the identity is already settled. MIDRANGE is named by position rather than function on purpose, because we have not yet pinned down what it distinctly controls, and a name should promise only what it can keep.
 
-Each axis has a modifier, a contrast slider, and (for Emphasize) a boost slider:
+## Modifiers
 
-- **Emphasize** redistributes: the LoRA runs *stronger than your prompt strength* inside the chosen zone and correspondingly weaker outside it, with the average across the run/model staying exactly at your prompt strength. **Boost** scales how tall the bell is (`1` = normal, `2` = twice the amplitude, `0.5` = gentle).
-- **Suppress**: the LoRA is attenuated inside the zone and runs at full strength everywhere else. The go-to modifier for removing something (style bleed, face distortion) while keeping the rest intact.
-- **Isolate**: the LoRA applies *only* in the zone — full strength there, attenuated everywhere else. Deliberately drastic; useful for zone-only work like pure style transfer. Expect character likeness to drop: identity needs most of the model at near-full strength.
-- **Contrast** sets how far factors move from neutral: `0` = no effect at all, `1` = maximum. For Suppress/Isolate that is the attenuation depth; for Emphasize it scales the bell together with Boost.
+Each axis has three modes and a contrast slider.
 
-The two axes multiply. Emphasize can push a zone above your `<lora:...:s>` strength (capped at 2x); very strong boosts can overbake a LoRA — if results look fried, lower Boost before lowering strength.
+**Emphasize** makes the LoRA stronger inside the chosen zone and correspondingly weaker outside it, while the average over the whole run stays exactly at your prompt strength. Think of it as redistributing a fixed budget rather than adding or removing. The Boost slider scales how far the redistribution goes: 1 is normal, 2 is twice the swing, 0.5 is gentle.
 
-Typical recipes (validated live on Krea 2 character LoRAs): the flagship for a character LoRA that drags its training style into everything — blocks `CHARACTER` + `Emphasize` at contrast 0.5, which boosts identity and trims the style blocks in one move; alternatively blocks `STYLE` + `Suppress` (raise the LoRA's prompt strength a notch to compensate, which can even recover features the trainer masked out). A style LoRA that deforms faces — blocks `CHARACTER` + `Suppress`. Favoring identity on the time axis — timesteps `COMPOSITION` + `Emphasize` (identity forms in the early steps; on short Turbo schedules the timestep `CHARACTER` zone is usually too late for faces).
+**Suppress** weakens the LoRA inside the zone and leaves everything else at full strength. This is the go to mode for removing something specific, such as style bleed or face distortion, while keeping the rest intact.
 
-### Filter
+**Isolate** applies the LoRA only inside the zone and attenuates it everywhere else. This mode is deliberately drastic. It suits zone only work such as pure style transfer, and you should expect character likeness to drop with it, because identity needs most of the model at near full strength.
 
-Some LoRAs must not be scheduled at all — above all **accelerator LoRAs** (Turbo, Lightning, Hyper, LCM, DMD), which are part of the checkpoint's distillation and break when their strength changes mid-run. The filter excludes them by default via name matching; edit the pattern list, or switch to `include` mode to schedule only the LoRAs you name.
+**Contrast** sets how far the factors move from neutral: 0 does nothing at all, 1 is the maximum. For Suppress and Isolate it is the attenuation depth. For Emphasize it scales the redistribution together with Boost.
 
-### Text encoder
+The two axes multiply, and Emphasize can push a zone above your prompt strength, capped at two times. If results start to look fried, lower Boost first.
 
-The text-encoder half of a LoRA is applied once, at prompt encoding, so it cannot be scheduled; it runs at your prompt-tag strength. Untick the TE checkbox to drop it entirely (useful when testing what the model half does on its own).
+## Recipes
 
-### Hires fix and img2img
+A character LoRA that drags its training style into everything: Blocks `CHARACTER` + `Emphasize` at contrast 0.5. Alternatively Blocks `STYLE` + `Suppress`, and consider raising the LoRA's prompt strength a notch to compensate. In our tests that combination even recovered clothing details that the LoRA trainer had deliberately masked out during training.
 
-No settings needed: scheduling is anchored to the sampler's actual noise level, so the hires pass and img2img automatically land on the late part of the timestep curve, matching what those passes really do.
+A style LoRA that deforms faces: Blocks `CHARACTER` + `Suppress`.
 
-### XYZ grid
+Protecting identity on the time axis: Timesteps `COMPOSITION` + `Emphasize` at moderate contrast.
 
-Ten axes are registered under `(LoraCtl) ...` — both presets, modifiers, contrasts, boosts, and the two timestep zone boundaries — so you can sweep any of them systematically.
+Start with one axis at a time. The axes multiply, and two aggressive settings at once attenuate much harder than either alone.
 
-### Reproducibility
+## The filter
 
-All settings are written into the generation's infotext (`LoraCtl blocks`, `LoraCtl time`, `LoraCtl TE`, `LoraCtl filter`).
+Some LoRAs must never be scheduled. Above all this means accelerator LoRAs such as Turbo, Lightning, Hyper, LCM and DMD, which are part of the checkpoint's distillation and break when their strength changes mid run. The filter excludes them by default through name matching. You can edit the pattern list, or switch to include mode to schedule only the LoRAs you name.
 
-## Notes and caveats
+## Everything else worth knowing
 
-- Scheduled LoRAs are applied **on-the-fly** (never merged into the weights), which costs some speed on the affected layers — the same trade-off as Forge's own "Patch LoRAs on-the-fly" option, applied only to the LoRAs you schedule.
-- Enable **Debug logging** to see the captured sigma schedule, the zone boundaries, which LoRAs were scheduled, and a per-run summary — include that output in any bug report.
-- The extension pins a specific Forge Neo internal API and refuses (loudly, in the console) rather than misbehaving if Forge changes it; your LoRAs then still apply at plain prompt strength.
+The text encoder half of a LoRA is applied once, when your prompt is encoded, so it cannot be scheduled over time. It runs at your prompt strength. Untick the TE checkbox to drop it entirely.
+
+Hires fix and img2img need no settings. Scheduling is anchored to the sampler's actual noise level, so those passes land on the late part of the timestep curve automatically, which matches what they really do.
+
+Ten XYZ grid axes are registered under `(LoraCtl)`: both presets, modifiers, contrasts, boosts, and the two timestep zone boundaries. Sweeping contrast in a grid is the fastest way to find the right depth for your LoRA.
+
+All settings are written into the generation's infotext, so any image you keep documents exactly how it was made.
+
+Scheduled LoRAs are applied on the fly instead of being merged into the weights. This costs some generation speed on the affected layers, the same trade off as Forge's own "Patch LoRAs on-the-fly" option, applied only to the LoRAs you schedule.
+
+Enable Debug logging to see the captured sigma schedule, the zone boundaries, which LoRAs were scheduled and a per run summary. Include that output in any bug report.
+
+The extension pins a specific Forge Neo internal API. If a Forge update changes it, the extension refuses loudly in the console instead of misbehaving, and your LoRAs then still apply at plain prompt strength.
 
 ## Technical documentation
 
-See [docs/MECHANISM.md](docs/MECHANISM.md) for how the extension integrates with Forge Neo, and [docs/PLAN.md](docs/PLAN.md) for the development plan.
+See [docs/MECHANISM.md](docs/MECHANISM.md) for how the extension integrates with Forge Neo, and [docs/PLAN.md](docs/PLAN.md) for the development plan and design decisions.
