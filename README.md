@@ -20,7 +20,9 @@ Copy or clone this folder into `extensions/` inside your Forge Neo install and r
 
 Add LoRAs to your prompt as usual, for example `<lora:my_character:1>`. Open the Neo-LoraCtl accordion, tick Enable, and pick a preset on either axis or both.
 
-If you want one recipe to start with: for a character LoRA that bleeds style into your images, set Blocks to `CHARACTER`, Modifier to `Emphasize`, Contrast to 0.5, and leave the Timesteps at `FLAT`. This is the combination in the middle panel above.
+If you want one recipe to start with: for a character LoRA that bleeds style into your images, set Blocks to `CHARACTER`, Modifier to `Emphasize`, Contrast to 0.5, and leave the Timesteps at `FLAT`. This is the combination in the middle panel above, and here is what it looks like in the UI:
+
+![Neo-LoraCtl panel](img/screenshot.png)
 
 ## Blocks: where in the model the LoRA acts
 
