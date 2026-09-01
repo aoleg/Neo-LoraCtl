@@ -45,7 +45,7 @@ Each axis has a modifier, a contrast slider, and (for Emphasize) a boost slider:
 
 The two axes multiply. Emphasize can push a zone above your `<lora:...:s>` strength (capped at 2x); very strong boosts can overbake a LoRA — if results look fried, lower Boost before lowering strength.
 
-Typical recipes: a character LoRA that drags its training style into everything — blocks `STYLE` + `Suppress` (raise the LoRA's prompt strength a notch to compensate, which can even recover features the trainer masked out); a style LoRA that deforms faces — blocks `CHARACTER` + `Suppress`; gently favoring identity — timesteps `COMPOSITION` + `Emphasize` at moderate contrast.
+Typical recipes (validated live on Krea 2 character LoRAs): the flagship for a character LoRA that drags its training style into everything — blocks `CHARACTER` + `Emphasize` at contrast 0.5, which boosts identity and trims the style blocks in one move; alternatively blocks `STYLE` + `Suppress` (raise the LoRA's prompt strength a notch to compensate, which can even recover features the trainer masked out). A style LoRA that deforms faces — blocks `CHARACTER` + `Suppress`. Favoring identity on the time axis — timesteps `COMPOSITION` + `Emphasize` (identity forms in the early steps; on short Turbo schedules the timestep `CHARACTER` zone is usually too late for faces).
 
 ### Filter
 
