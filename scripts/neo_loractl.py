@@ -146,6 +146,7 @@ class NeoLoraCtlScript(scripts.Script):
     cb_count: int = 0
     factor_min: float = 1.0
     factor_max: float = 0.0
+    factors_seen: list = []
     diag_done: bool = False
 
     # ------------------------------------------------------------------
@@ -270,6 +271,7 @@ class NeoLoraCtlScript(scripts.Script):
         cls.cb_count = 0
         cls.factor_min = 1.0
         cls.factor_max = 0.0
+        cls.factors_seen = []
         cls.diag_done = False
         cls.sigma0 = None
         cls.captured_schedule = []
@@ -443,6 +445,7 @@ class NeoLoraCtlScript(scripts.Script):
         cls.cb_count += 1
         cls.factor_min = min(cls.factor_min, factor)
         cls.factor_max = max(cls.factor_max, factor)
+        cls.factors_seen.append(factor)
         if not cls.diag_done:
             cls.diag_done = True
             if cls.debug:
@@ -462,6 +465,11 @@ class NeoLoraCtlScript(scripts.Script):
             else:
                 _log(f"summary: {cls.cb_count} callback invocations, "
                      f"time factor range [{cls.factor_min:.4f}, {cls.factor_max:.4f}]")
+                _log("per-step time factors: "
+                     + ", ".join(f"{f:.3f}" for f in cls.factors_seen))
+                if cls.block_mask:
+                    _log("block mask: "
+                         + ", ".join(f"{v:.2f}" for v in cls.block_mask))
         # Entries deliberately persist across generations: the stock loader
         # reuses its LoRA application when the hash is unchanged, and our
         # entries reference the same live OnlineLoRAPatch objects. Staleness
