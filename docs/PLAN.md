@@ -6,7 +6,7 @@ This is the technical planning document. User-facing documentation lives in `REA
 
 ## Design summary (decisions recorded 2026-09-01)
 
-Effective per-key, per-step strength is a product: `user_strength × block_factor(key) × time_factor(sigma)`, with both factors in `[floor, 1.0]` — never above the prompt-tag strength.
+Effective per-key, per-step strength is a product: `user_strength × block_factor(key) × time_factor(sigma)`, with factors in `[0, 2.0]` — Suppress/Isolate stay at or below 1, Emphasize redistributes around 1 with the mean conserved.
 
 | Decision | Resolution |
 |---|---|
