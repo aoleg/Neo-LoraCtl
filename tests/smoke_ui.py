@@ -21,6 +21,8 @@ scripts_mod.basedir = lambda: REPO
 shared_mod = types.ModuleType("modules.shared")
 callbacks_mod = types.ModuleType("modules.script_callbacks")
 callbacks_mod.on_cfg_denoiser = lambda fn: None
+callbacks_mod.on_before_ui = lambda fn: None
+scripts_mod.scripts_data = []
 modules.scripts = scripts_mod
 modules.shared = shared_mod
 modules.script_callbacks = callbacks_mod
@@ -38,5 +40,5 @@ spec.loader.exec_module(mod)
 with gr.Blocks():
     components = mod.NeoLoraCtlScript().ui(False)
 
-assert len(components) == 8, f"expected 8 components, got {len(components)}"
+assert len(components) == 13, f"expected 13 components, got {len(components)}"
 print(f"OK: gradio {gr.__version__}, {len(components)} components built")

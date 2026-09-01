@@ -1,19 +1,19 @@
 """Neo-LoraCtl — block- and timestep-aware LoRA strength control for Forge Neo.
 
-Phase 1: time axis (sigma-zone presets) driving prompt-loaded LoRAs through
-per-key online patches. Block axis lands in phase 2; loractl_core.py already
-carries its math.
+Two symmetric axes, multiplied per patch key per sampling step:
+  effective = base * block_factor(key) * time_factor(sigma / schedule_sigma0)
 
-Mechanism (Forge Neo commit 92b55e1b, see docs/PLAN.md):
+Mechanism (Forge Neo commit 92b55e1b, see docs/PLAN.md and docs/MECHANISM.md):
 - networks.load_lora_for_models is intercepted; LoRAs passing the
   include/exclude filter are loaded with online_mode=True, which turns each
   of their patches into an OnlineLoRAPatch object in weight_wrapper_patches.
 - New objects are adopted by snapshot-diff (core.ScheduleSet.collect), which
-  refuses on any API-shape drift.
+  refuses on any API-shape drift. Block factors bind at adoption and rebind
+  in-place when the block preset changes (no LoRA reload needed).
 - An on_cfg_denoiser callback rewrites the adopted objects' strengths every
-  step: base * block_factor * time_factor(sigma / schedule_sigma0).
-- p.sampler.get_sigmas is wrapped READ-ONLY to capture the full schedule head
-  for sigma normalization; the hires pass lands on the curve tail naturally.
+  step. p.sampler.get_sigmas is wrapped READ-ONLY to capture the schedule
+  head for sigma normalization; the hires pass lands on the curve tail
+  naturally.
 """
 
 import importlib.util
@@ -23,7 +23,7 @@ import sys
 import gradio as gr
 
 from modules import scripts, shared
-from modules.script_callbacks import on_cfg_denoiser
+from modules.script_callbacks import on_before_ui, on_cfg_denoiser
 
 # Load the framework-agnostic core. It MUST be registered in sys.modules
 # before exec: its dataclasses resolve annotations via
@@ -35,6 +35,7 @@ sys.modules["neo_loractl_core"] = core
 _spec.loader.exec_module(core)
 
 TAG = "[LoraCtl]"
+DEV_MODE = os.environ.get("LORACTL_DEV", "") == "1"
 
 _original_load_lora_for_models = None
 
@@ -96,6 +97,7 @@ def _intercepted_load_lora_for_models(model, clip, lora, strength_model, strengt
              f"'{os.path.basename(filename)}' left unscheduled")
         return new_model, new_clip
 
+    cls.ensure_block_context(new_model, wrappers)
     errors = cls.sched.collect(before, wrappers, cls.block_factor_for_key)
     if errors:
         _log(f"ERROR: refusing to schedule '{os.path.basename(filename)}' "
@@ -112,13 +114,25 @@ def _intercepted_load_lora_for_models(model, clip, lora, strength_model, strengt
 
 
 class NeoLoraCtlScript(scripts.Script):
-    # --- config (set in process() from UI args) ---
+    # --- config (set in process() from UI args + XYZ overrides) ---
     enabled: bool = False
     te_enabled: bool = True
     patterns: list = []
     filter_mode: str = "exclude"
     time_curve = core.TimeCurve()
+    block_preset: str = "FULL"
+    block_modifier: str = "Emphasize"
+    block_contrast: float = 0.0
+    dev_mask_text: str = ""
     debug: bool = False
+
+    # --- block context (bound to the current model, built lazily) ---
+    block_sig = None
+    block_arch: str = core.ARCH_UNKNOWN
+    block_count: int = 0
+    num_double: int = 0
+    block_mask = None       # list[float] | None (None until built)
+    arch_logged: bool = False
 
     # --- runtime state ---
     sched = core.ScheduleSet()
@@ -134,9 +148,69 @@ class NeoLoraCtlScript(scripts.Script):
     factor_max: float = 0.0
     diag_done: bool = False
 
+    # ------------------------------------------------------------------
+    # Block axis
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def ensure_block_context(cls, model, wrappers):
+        """Bind arch/count to the live model (introspection first, patch-key
+        fallback) and build the mask. Cheap no-op once built."""
+        if cls.block_mask is not None:
+            return
+        if cls.block_count == 0:
+            dm = getattr(getattr(model, "model", None), "diffusion_model", None)
+            if dm is not None and hasattr(dm, "double_blocks"):
+                cls.block_arch = core.ARCH_FLUX
+                cls.num_double = len(dm.double_blocks)
+                cls.block_count = cls.num_double + len(getattr(dm, "single_blocks", []))
+            elif dm is not None and hasattr(dm, "input_blocks"):
+                cls.block_arch = core.ARCH_SD
+                cls.block_count = 26
+            elif dm is not None and hasattr(dm, "blocks"):
+                cls.block_arch = core.ARCH_FLAT
+                cls.block_count = len(dm.blocks)
+            else:
+                cls.block_arch = core.detect_arch(wrappers.keys())
+                if cls.block_arch != core.ARCH_UNKNOWN:
+                    cls.block_count, cls.num_double = core.infer_block_layout(
+                        wrappers.keys(), cls.block_arch)
+            if not cls.arch_logged:
+                cls.arch_logged = True
+                if cls.block_arch == core.ARCH_UNKNOWN:
+                    _log("block axis: unknown architecture; block presets inactive "
+                         "(factor 1.0 everywhere)")
+                elif cls.debug:
+                    _log(f"block axis: arch={cls.block_arch} blocks={cls.block_count}"
+                         + (f" (double={cls.num_double})" if cls.num_double else ""))
+        cls.block_mask = cls.build_block_mask()
+
+    @classmethod
+    def build_block_mask(cls):
+        if cls.block_arch == core.ARCH_UNKNOWN or cls.block_count < 1:
+            return []
+        if DEV_MODE and cls.dev_mask_text.strip():
+            override = core.parse_mask_override(cls.dev_mask_text, cls.block_count)
+            if override is not None:
+                _log(f"DEV: explicit block mask in effect ({cls.block_count} values)")
+                return override
+            _log(f"DEV: block mask override ignored (need exactly "
+                 f"{cls.block_count} numeric values)")
+        return core.build_block_mask(cls.block_count, cls.block_preset,
+                                     cls.block_modifier, cls.block_contrast)
+
     @classmethod
     def block_factor_for_key(cls, key):
-        return 1.0  # phase 2: arch classification + block mask
+        if not cls.block_mask:
+            return 1.0
+        idx = core.classify_key(key, cls.block_arch, cls.num_double)
+        if idx is None or idx >= len(cls.block_mask):
+            return 1.0
+        return cls.block_mask[idx]
+
+    # ------------------------------------------------------------------
+    # Script plumbing
+    # ------------------------------------------------------------------
 
     def title(self):
         return "Neo-LoraCtl"
@@ -147,8 +221,17 @@ class NeoLoraCtlScript(scripts.Script):
     def ui(self, is_img2img):
         with gr.Accordion("Neo-LoraCtl", open=False):
             enabled = gr.Checkbox(label="Enable", value=False)
-            gr.Markdown("Schedules the strength of prompt-loaded `<lora:...>` "
-                        "networks over the sampling run (by sigma).")
+            gr.Markdown("Focuses prompt-loaded `<lora:...>` networks on what you "
+                        "want from them: pick **where** in the model (blocks) and "
+                        "**when** in the run (timesteps) each LoRA applies.")
+            gr.Markdown("**Blocks** — what the LoRA is allowed to shape")
+            with gr.Row():
+                block_preset = gr.Dropdown(choices=list(core.BLOCK_PRESETS), value="FULL",
+                                           label="Block preset")
+                block_modifier = gr.Radio(choices=list(core.MODIFIERS), value="Emphasize",
+                                          label="Modifier")
+                block_contrast = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Contrast")
+            gr.Markdown("**Timesteps** — when in the run the LoRA applies")
             with gr.Row():
                 time_preset = gr.Dropdown(choices=list(core.TIME_PRESETS), value="FLAT",
                                           label="Timestep preset")
@@ -167,12 +250,20 @@ class NeoLoraCtlScript(scripts.Script):
             gr.Markdown("*Accelerator LoRAs (turbo/lightning/...) must stay excluded — "
                         "scheduling them breaks distilled checkpoints.*")
             debug = gr.Checkbox(label="Debug logging", value=False)
-        return [enabled, time_preset, time_modifier, time_contrast,
-                te_enabled, filter_mode, filter_patterns, debug]
+            with gr.Row(visible=DEV_MODE):
+                dev_mask = gr.Textbox(value="", label="DEV: explicit block mask",
+                                      placeholder="one value per block, comma-separated")
+                dev_bounds = gr.Textbox(value="", label="DEV: time boundaries hi,lo",
+                                        placeholder=f"{core.DEFAULT_TIME_HI_BOUNDARY},"
+                                                    f"{core.DEFAULT_TIME_LO_BOUNDARY}")
+        return [enabled, block_preset, block_modifier, block_contrast,
+                time_preset, time_modifier, time_contrast,
+                te_enabled, filter_mode, filter_patterns, debug, dev_mask, dev_bounds]
 
-    def process(self, p, enabled=False, time_preset="FLAT", time_modifier="Emphasize",
+    def process(self, p, enabled=False, block_preset="FULL", block_modifier="Emphasize",
+                block_contrast=0.7, time_preset="FLAT", time_modifier="Emphasize",
                 time_contrast=0.7, te_enabled=True, filter_mode="exclude",
-                filter_patterns="", debug=False, *args):
+                filter_patterns="", debug=False, dev_mask="", dev_bounds="", *args):
         cls = NeoLoraCtlScript
         cls.enabled = bool(enabled) and _install_interception()
         cls.debug = bool(debug)
@@ -184,16 +275,68 @@ class NeoLoraCtlScript(scripts.Script):
         cls.captured_schedule = []
         if not cls.enabled:
             return
+
+        # XYZ grid overrides (apply_field sets these on the per-cell p).
+        block_preset = getattr(p, "loractl_xyz_block_preset", block_preset)
+        block_modifier = getattr(p, "loractl_xyz_block_modifier", block_modifier)
+        block_contrast = getattr(p, "loractl_xyz_block_contrast", block_contrast)
+        time_preset = getattr(p, "loractl_xyz_time_preset", time_preset)
+        time_modifier = getattr(p, "loractl_xyz_time_modifier", time_modifier)
+        time_contrast = getattr(p, "loractl_xyz_time_contrast", time_contrast)
+        time_hi = getattr(p, "loractl_xyz_time_hi", None)
+        time_lo = getattr(p, "loractl_xyz_time_lo", None)
+
         cls.te_enabled = bool(te_enabled)
         cls.patterns = core.parse_patterns(filter_patterns)
         cls.filter_mode = filter_mode if filter_mode in ("exclude", "include") else "exclude"
+
+        hi = core.DEFAULT_TIME_HI_BOUNDARY
+        lo = core.DEFAULT_TIME_LO_BOUNDARY
+        if DEV_MODE and str(dev_bounds).strip():
+            parsed = core.parse_mask_override(dev_bounds, 2)
+            if parsed is not None:
+                hi, lo = parsed
+            else:
+                _log("DEV: time boundaries override ignored (need 'hi,lo')")
+        if time_hi is not None:
+            hi = float(time_hi)
+        if time_lo is not None:
+            lo = float(time_lo)
+        if not (0.0 <= lo < hi <= 1.0):
+            _log(f"invalid time boundaries hi={hi} lo={lo}; using defaults")
+            hi, lo = core.DEFAULT_TIME_HI_BOUNDARY, core.DEFAULT_TIME_LO_BOUNDARY
+
         cls.time_curve = core.TimeCurve(
             preset=time_preset if time_preset in core.TIME_PRESETS else "FLAT",
             modifier=time_modifier if time_modifier in core.MODIFIERS else "Emphasize",
             contrast=float(time_contrast),
+            hi_boundary=hi, lo_boundary=lo,
         )
+
+        block_sig = (str(block_preset), str(block_modifier), float(block_contrast),
+                     str(dev_mask))
+        if block_sig != cls.block_sig:
+            cls.block_sig = block_sig
+            cls.block_preset = block_preset if block_preset in core.BLOCK_PRESETS else "FULL"
+            cls.block_modifier = (block_modifier if block_modifier in core.MODIFIERS
+                                  else "Emphasize")
+            cls.block_contrast = float(block_contrast)
+            cls.dev_mask_text = str(dev_mask)
+            cls.block_mask = None  # rebuild lazily (count may be unknown yet)
+            if cls.sched.entries and cls.block_count:
+                # Entries persist across generations; rebind without a reload.
+                cls.block_mask = cls.build_block_mask()
+                cls.sched.rebind_block_factors(cls.block_factor_for_key)
+                if cls.debug:
+                    _log("block config changed; rebound factors on "
+                         f"{len(cls.sched.entries)} entries")
+
+        p.extra_generation_params["LoraCtl blocks"] = (
+            f"{cls.block_preset}/{cls.block_modifier}/{cls.block_contrast:g}")
         p.extra_generation_params["LoraCtl time"] = (
             f"{cls.time_curve.preset}/{cls.time_curve.modifier}/{cls.time_curve.contrast:g}")
+        if (hi, lo) != (core.DEFAULT_TIME_HI_BOUNDARY, core.DEFAULT_TIME_LO_BOUNDARY):
+            p.extra_generation_params["LoraCtl bounds"] = f"{hi:g},{lo:g}"
         p.extra_generation_params["LoraCtl TE"] = "on" if cls.te_enabled else "off"
         p.extra_generation_params["LoraCtl filter"] = (
             f"{cls.filter_mode}:{','.join(cls.patterns)}")
@@ -230,6 +373,12 @@ class NeoLoraCtlScript(scripts.Script):
             cls.sched.last_factor = None
             if not kept:
                 cls.scheduled_files = []
+                # Model changed under us: rebind block context too.
+                cls.block_count = 0
+                cls.num_double = 0
+                cls.block_arch = core.ARCH_UNKNOWN
+                cls.block_mask = None
+                cls.arch_logged = False
                 _null_lora_hash(p)
                 if cls.debug:
                     _log("scheduled entries went stale; forcing LoRA reload")
@@ -240,7 +389,8 @@ class NeoLoraCtlScript(scripts.Script):
         if cls.enabled and cls.debug:
             _log(f"active: {len(cls.scheduled_files)} scheduled LoRA(s) "
                  f"{cls.scheduled_files}, {len(cls.sched.entries)} patch entries, "
-                 f"curve={cls.time_curve.preset}/{cls.time_curve.modifier}"
+                 f"blocks={cls.block_preset}/{cls.block_modifier}/{cls.block_contrast:g}, "
+                 f"time={cls.time_curve.preset}/{cls.time_curve.modifier}"
                  f"/{cls.time_curve.contrast:g}")
 
     def process_before_every_sampling(self, p, *args, **kwargs):
@@ -297,7 +447,7 @@ class NeoLoraCtlScript(scripts.Script):
             cls.diag_done = True
             if cls.debug:
                 _log(f"diagnostic: step 0 sigma={sigma:.4f} sigma0={cls.sigma0:.4f} "
-                     f"factor={factor:.4f} entries={len(cls.sched.entries)}")
+                     f"time_factor={factor:.4f} entries={len(cls.sched.entries)}")
 
     def postprocess(self, p, processed, *args):
         cls = NeoLoraCtlScript
@@ -311,11 +461,47 @@ class NeoLoraCtlScript(scripts.Script):
                      "or a dispatch problem)")
             else:
                 _log(f"summary: {cls.cb_count} callback invocations, "
-                     f"factor range [{cls.factor_min:.4f}, {cls.factor_max:.4f}]")
+                     f"time factor range [{cls.factor_min:.4f}, {cls.factor_max:.4f}]")
         # Entries deliberately persist across generations: the stock loader
         # reuses its LoRA application when the hash is unchanged, and our
         # entries reference the same live OnlineLoRAPatch objects. Staleness
         # is handled in before_process_batch.
 
 
+# ---------------------------------------------------------------------------
+# XYZ grid axes
+# ---------------------------------------------------------------------------
+
+def _register_xyz_axes():
+    xyz = None
+    for data in scripts.scripts_data:
+        if data.script_class.__module__ in ("xyz_grid.py", "scripts.xyz_grid", "xyz_grid"):
+            xyz = data.module
+            break
+    if xyz is None:
+        return
+    if any(getattr(opt, "label", "").startswith("(LoraCtl)") for opt in xyz.axis_options):
+        return
+
+    def choice(label, field, choices):
+        return xyz.AxisOption(f"(LoraCtl) {label}", str, xyz.apply_field(field),
+                              choices=lambda: list(choices))
+
+    def number(label, field):
+        return xyz.AxisOption(f"(LoraCtl) {label}", float, xyz.apply_field(field))
+
+    xyz.axis_options.extend([
+        choice("Block preset", "loractl_xyz_block_preset", core.BLOCK_PRESETS),
+        choice("Block modifier", "loractl_xyz_block_modifier", core.MODIFIERS),
+        number("Block contrast", "loractl_xyz_block_contrast"),
+        choice("Time preset", "loractl_xyz_time_preset", core.TIME_PRESETS),
+        choice("Time modifier", "loractl_xyz_time_modifier", core.MODIFIERS),
+        number("Time contrast", "loractl_xyz_time_contrast"),
+        number("Time hi boundary", "loractl_xyz_time_hi"),
+        number("Time lo boundary", "loractl_xyz_time_lo"),
+    ])
+    _log("registered 8 XYZ grid axes")
+
+
+on_before_ui(_register_xyz_axes)
 on_cfg_denoiser(NeoLoraCtlScript.on_cfg)

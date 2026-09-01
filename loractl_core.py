@@ -289,11 +289,27 @@ def lora_is_scheduled(filename: str, patterns: list[str], mode: str) -> bool:
 # Per-step scheduling of OnlineLoRAPatch objects
 # ---------------------------------------------------------------------------
 
+def parse_mask_override(text: str, count: int) -> list[float] | None:
+    """Dev-only: parse an explicit per-block mask ('1, 0.5, ...'). Returns
+    None (with no side effects) unless exactly `count` finite values parse."""
+    tokens = [t for t in re.split(r"[,;\s]+", (text or "").strip()) if t]
+    if len(tokens) != count:
+        return None
+    try:
+        values = [float(t) for t in tokens]
+    except ValueError:
+        return None
+    if any(v != v or v in (float("inf"), float("-inf")) for v in values):
+        return None
+    return values
+
+
 @dataclass
 class ScheduledEntry:
     obj: object          # OnlineLoRAPatch-like: .patch = [5-tuple]
     base_strength: float
     block_factor: float
+    key: str = ""
 
 
 @dataclass
@@ -322,6 +338,7 @@ class ScheduleSet:
                     obj=obj,
                     base_strength=float(obj.patch[0][0]),
                     block_factor=float(block_factor_for_key(key)),
+                    key=key,
                 ))
         if errors:
             return errors
@@ -338,6 +355,13 @@ class ScheduleSet:
         for e in self.entries:
             t = e.obj.patch[0]
             e.obj.patch[0] = (e.base_strength * e.block_factor * time_factor,) + t[1:]
+
+    def rebind_block_factors(self, block_factor_for_key) -> None:
+        """Recompute block factors for existing entries (block preset changed
+        without a LoRA reload) and force a rewrite on the next apply."""
+        for e in self.entries:
+            e.block_factor = float(block_factor_for_key(e.key))
+        self.last_factor = None
 
     def clear(self) -> None:
         self.entries.clear()

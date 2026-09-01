@@ -49,6 +49,7 @@ def _fake_gradio():
 # ---------------------------------------------------------------------------
 
 _cfg_callbacks = []
+_before_ui_callbacks = []
 
 
 def _fake_modules():
@@ -63,12 +64,14 @@ def _fake_modules():
     scripts_mod.Script = Script
     scripts_mod.AlwaysVisible = object()
     scripts_mod.basedir = lambda: REPO
+    scripts_mod.scripts_data = []
 
     shared_mod = types.ModuleType("modules.shared")
     shared_mod.sd_model = None
 
     callbacks_mod = types.ModuleType("modules.script_callbacks")
     callbacks_mod.on_cfg_denoiser = _cfg_callbacks.append
+    callbacks_mod.on_before_ui = _before_ui_callbacks.append
 
     class CFGDenoiserParams:
         def __init__(self, sigma):
@@ -95,15 +98,28 @@ class FakeOnlineLoRAPatch:
         return weight + self.patch[0][0]
 
 
+class FakeDM:
+    """Krea-2-shaped diffusion model: flat 28-block stack."""
+    def __init__(self, n_blocks=28):
+        self.blocks = [object()] * n_blocks
+
+
+class FakeInnerModel:
+    def __init__(self, n_blocks=28):
+        self.diffusion_model = FakeDM(n_blocks)
+
+
 class FakePatcher:
-    def __init__(self):
+    def __init__(self, n_blocks=28):
         self.patches = {}
         self.weight_wrapper_patches = {}
+        self.model = FakeInnerModel(n_blocks)
 
     def clone(self):
         n = FakePatcher()
         n.patches = {k: v[:] for k, v in self.patches.items()}
         n.weight_wrapper_patches = self.weight_wrapper_patches.copy()  # shares lists, like Forge
+        n.model = self.model
         return n
 
     def add_patches(self, keys, strength, online_mode, tuple_len=5):
@@ -183,9 +199,11 @@ class FakeP:
 def _load_script(networks_mod):
     for name in list(sys.modules):
         if name in ("gradio", "networks", "modules", "modules.scripts",
-                    "modules.shared", "modules.script_callbacks", "neo_loractl"):
+                    "modules.shared", "modules.script_callbacks", "neo_loractl",
+                    "neo_loractl_core"):
             del sys.modules[name]
     _cfg_callbacks.clear()
+    _before_ui_callbacks.clear()
     sys.modules["gradio"] = _fake_gradio()
     modules, scripts_mod, shared_mod, callbacks_mod = _fake_modules()
     sys.modules["modules"] = modules
@@ -202,9 +220,11 @@ def _load_script(networks_mod):
     return mod
 
 
-UI_DEFAULTS = dict(enabled=True, time_preset="FLAT", time_modifier="Emphasize",
+UI_DEFAULTS = dict(enabled=True, block_preset="FULL", block_modifier="Emphasize",
+                   block_contrast=1.0, time_preset="FLAT", time_modifier="Emphasize",
                    time_contrast=1.0, te_enabled=True, filter_mode="exclude",
-                   filter_patterns=core.DEFAULT_EXCLUDE_PATTERNS, debug=False)
+                   filter_patterns=core.DEFAULT_EXCLUDE_PATTERNS, debug=False,
+                   dev_mask="", dev_bounds="")
 
 
 class Harness:
@@ -231,10 +251,13 @@ class Harness:
             if result is not None:
                 self.sd_model.forge_objects.unet = result[0]
 
-    def generate(self, lora_files, strengths=None, ui=None, steps_schedule=KREA_SCHEDULE):
+    def generate(self, lora_files, strengths=None, ui=None, steps_schedule=KREA_SCHEDULE,
+                 p_attrs=None):
         ui_args = dict(UI_DEFAULTS)
         ui_args.update(ui or {})
         p = FakeP(self.sd_model, schedule=steps_schedule)
+        for k, v in (p_attrs or {}).items():
+            setattr(p, k, v)
         s = self.script
         s.process(p, **ui_args)
         s.before_process_batch(p)
@@ -423,6 +446,172 @@ class TestApiDrift(unittest.TestCase):
         for step in per_step:
             for s in step.values():
                 self.assertAlmostEqual(s, 0.5, places=9)
+
+
+STYLE_MASK = core.build_block_mask(28, "STYLE", "Emphasize", 1.0)
+
+
+class TestBlockAxis(unittest.TestCase):
+    def test_block_contrast_zero_is_phase1_identity(self):
+        h = Harness()
+        _, per_step = h.generate(["charA.safetensors"], strengths=[0.5],
+                                 ui={"block_preset": "STYLE", "block_contrast": 0.0})
+        for step in per_step:
+            for s in step.values():
+                self.assertAlmostEqual(s, 0.5, places=9)
+
+    def test_full_preset_is_phase1_identity(self):
+        h = Harness()
+        _, per_step = h.generate(["charA.safetensors"], strengths=[0.5],
+                                 ui={"block_preset": "FULL", "block_contrast": 1.0})
+        for step in per_step:
+            for s in step.values():
+                self.assertAlmostEqual(s, 0.5, places=9)
+
+    def test_arch_introspection_from_model(self):
+        h = Harness()
+        h.generate(["charA.safetensors"], ui={"block_preset": "STYLE"})
+        self.assertEqual(h.cls().block_arch, core.ARCH_FLAT)
+        self.assertEqual(h.cls().block_count, 28)
+
+    def test_combined_block_and_time_factors(self):
+        h = Harness()
+        _, per_step = h.generate(["charA.safetensors"], strengths=[0.5],
+                                 ui={"block_preset": "STYLE", "block_contrast": 1.0,
+                                     "time_preset": "COMPOSITION", "time_contrast": 1.0})
+        curve = core.TimeCurve("COMPOSITION", "Emphasize", 1.0)
+        for sigma, step in zip(KREA_SCHEDULE[:-1], per_step):
+            tf = curve.factor(core.normalize_sigma(sigma, 1.0))
+            self.assertAlmostEqual(
+                step["diffusion_model.blocks.0.attn.qkv.weight#0"],
+                0.5 * STYLE_MASK[0] * tf, places=9)
+            self.assertAlmostEqual(
+                step["diffusion_model.blocks.20.mlp.0.weight#0"],
+                0.5 * STYLE_MASK[20] * tf, places=9)
+            # Non-block key: block factor pinned at 1.0.
+            self.assertAlmostEqual(
+                step["diffusion_model.txtfusion.projector.weight#0"],
+                0.5 * tf, places=9)
+
+    def test_preset_change_rebinds_without_reload(self):
+        h = Harness()
+        h.generate(["charA.safetensors"], strengths=[0.5], ui={"block_preset": "FULL"})
+        self.assertEqual(len(h.networks.calls), 1)
+        h.generate(["charA.safetensors"], strengths=[0.5],
+                   ui={"block_preset": "STYLE", "block_contrast": 1.0})
+        self.assertEqual(len(h.networks.calls), 1)  # no reload happened
+        parked = h.snapshot_strengths()  # postprocess parks at base * block
+        self.assertAlmostEqual(
+            parked["diffusion_model.blocks.0.attn.qkv.weight#0"],
+            0.5 * STYLE_MASK[0], places=9)
+        self.assertAlmostEqual(
+            parked["diffusion_model.blocks.20.mlp.0.weight#0"],
+            0.5 * STYLE_MASK[20], places=9)
+
+    def test_suppress_style_inverts(self):
+        h = Harness()
+        h.generate(["charA.safetensors"], strengths=[0.5],
+                   ui={"block_preset": "STYLE", "block_modifier": "Suppress",
+                       "block_contrast": 1.0})
+        parked = h.snapshot_strengths()
+        self.assertAlmostEqual(
+            parked["diffusion_model.blocks.0.attn.qkv.weight#0"], 0.5, places=6)
+        self.assertAlmostEqual(  # block 20 is inside the STYLE zone -> suppressed
+            parked["diffusion_model.blocks.20.mlp.0.weight#0"],
+            0.5 * (1.0 - STYLE_MASK[20]), places=6)
+
+
+class TestXYZOverrides(unittest.TestCase):
+    def test_p_attributes_override_ui(self):
+        h = Harness()
+        _, per_step = h.generate(
+            ["charA.safetensors"], strengths=[0.5],
+            ui={"time_preset": "FLAT", "block_preset": "FULL"},
+            p_attrs={"loractl_xyz_time_preset": "COMPOSITION",
+                     "loractl_xyz_time_contrast": 1.0,
+                     "loractl_xyz_block_preset": "STYLE",
+                     "loractl_xyz_block_contrast": 1.0})
+        curve = core.TimeCurve("COMPOSITION", "Emphasize", 1.0)
+        tf_last = curve.factor(core.normalize_sigma(KREA_SCHEDULE[-2], 1.0))
+        self.assertAlmostEqual(
+            per_step[-1]["diffusion_model.blocks.27.mlp.0.weight#0"]
+            if "diffusion_model.blocks.27.mlp.0.weight#0" in per_step[-1]
+            else per_step[-1]["diffusion_model.blocks.20.mlp.0.weight#0"],
+            0.5 * STYLE_MASK[20] * tf_last, places=9)
+
+    def test_boundary_override_moves_zone(self):
+        h = Harness()
+        _, per_step = h.generate(
+            ["charA.safetensors"], strengths=[0.5],
+            ui={"time_preset": "COMPOSITION", "time_contrast": 1.0},
+            p_attrs={"loractl_xyz_time_hi": 0.70})
+        # sigma 0.7595 is above the moved 0.70 boundary -> full strength;
+        # with the default 0.90 boundary it would be attenuated to ~0.
+        step_idx = KREA_SCHEDULE.index(0.7595)
+        for s in per_step[step_idx].values():
+            self.assertGreater(s, 0.45)
+
+    def test_axis_registration_with_fake_xyz(self):
+        h = Harness()
+
+        class FakeAxisOption:
+            def __init__(self, label, type_, apply, choices=None):
+                self.label = label
+                self.apply = apply
+                self.choices = choices
+
+        xyz_mod = types.SimpleNamespace(
+            axis_options=[],
+            AxisOption=FakeAxisOption,
+            apply_field=lambda field: lambda p, x, xs: setattr(p, field, x),
+        )
+        entry = types.SimpleNamespace(
+            script_class=type("XYZ", (), {"__module__": "xyz_grid.py"}),
+            module=xyz_mod)
+        sys.modules["modules.scripts"].scripts_data.append(entry)
+        for cb in _before_ui_callbacks:
+            cb()
+        labels = [o.label for o in xyz_mod.axis_options]
+        self.assertEqual(len(labels), 8)
+        self.assertIn("(LoraCtl) Time preset", labels)
+        self.assertIn("(LoraCtl) Block contrast", labels)
+        for cb in _before_ui_callbacks:  # re-registration guard
+            cb()
+        self.assertEqual(len(xyz_mod.axis_options), 8)
+        # The applied field lands where process() reads it.
+        opt = next(o for o in xyz_mod.axis_options if o.label == "(LoraCtl) Time preset")
+        p = types.SimpleNamespace()
+        opt.apply(p, "DETAIL", ["DETAIL"])
+        self.assertEqual(p.loractl_xyz_time_preset, "DETAIL")
+
+
+class TestDevMode(unittest.TestCase):
+    def test_explicit_mask_override(self):
+        os.environ["LORACTL_DEV"] = "1"
+        try:
+            h = Harness()  # module reloads and reads the env var
+            mask = ",".join(["0.25"] * 28)
+            h.generate(["charA.safetensors"], strengths=[0.8],
+                       ui={"block_preset": "FULL", "dev_mask": mask})
+            parked = h.snapshot_strengths()
+            self.assertAlmostEqual(
+                parked["diffusion_model.blocks.0.attn.qkv.weight#0"], 0.2, places=9)
+            self.assertAlmostEqual(  # non-block key unaffected by the mask
+                parked["diffusion_model.txtfusion.projector.weight#0"], 0.8, places=9)
+        finally:
+            del os.environ["LORACTL_DEV"]
+
+    def test_bad_mask_ignored(self):
+        os.environ["LORACTL_DEV"] = "1"
+        try:
+            h = Harness()
+            h.generate(["charA.safetensors"], strengths=[0.8],
+                       ui={"dev_mask": "1,2,3"})  # wrong length
+            parked = h.snapshot_strengths()
+            for s in parked.values():
+                self.assertAlmostEqual(s, 0.8, places=9)
+        finally:
+            del os.environ["LORACTL_DEV"]
 
 
 class TestSigmaCapture(unittest.TestCase):
