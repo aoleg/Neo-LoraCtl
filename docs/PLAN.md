@@ -16,8 +16,8 @@ Effective per-key, per-step strength is a product: `user_strength × block_facto
 | Text encoder | Untouched by default (stock loader applies TE at prompt strength). Single on/off toggle; off = TE half at strength 0. |
 | Time axis | Three zones bounded in **sigma** (not step fraction): COMPOSITION / CHARACTER / DETAIL, plus FLAT. Smooth (smoothstep) transitions in sigma domain. |
 | Block axis | Three zones over the block index: COMPOSITION / CHARACTER / STYLE, plus FULL. Krea 2: 28 flat blocks split in even thirds (0–8 / 9–18 / 19–27), smoothstep shoulders of fixed internal width (2–3 blocks). Non-block keys (embeddings, final layer, text-fusion `layerwise_blocks`/`refiner_blocks`) fixed at 1.0. |
-| Modifier | Each axis: emphasize (zone at 1.0, rest attenuated to floor) or suppress (zone attenuated, rest at 1.0). |
-| Knobs | One contrast slider per axis (0 = flat/no-op, 1 = hard mask; floor = 1 − contrast). Shoulder width and zone boundaries not user-exposed. |
+| Modifier | Each axis: Emphasize (mean-preserving redistribution — zone boosted above prompt strength, rest lowered, average exactly 1; revised 2026-09-01 after live calibration), Suppress (zone attenuated, rest at 1.0), or Isolate (zone at 1.0, rest attenuated — the original emphasize under an honest name). Factors cap at 2.0. |
+| Knobs | One contrast slider per axis (0 = flat/no-op, 1 = maximum), plus a Boost slider per axis (0.25-2, default 1) scaling the Emphasize amplitude (a = contrast x boost). Shoulder width and zone boundaries not user-exposed (XYZ/dev-mode only). |
 | Hires pass | No special-casing and no toggle: the time factor is evaluated on actual sigma, so hires (starting at a denoise-strength-determined sigma) lands on the tail of the curve automatically. Block masks apply unchanged. |
 | UI | One accordion, two symmetric clusters: Blocks [preset | modifier | contrast] and Timesteps [preset | modifier | contrast], plus enable, TE toggle, filter, debug toggle. No numeric per-block/per-step entry in the UI (a dev-only path exists for calibration). |
 | Infotext | Every setting written to generation parameters from phase 1. |
