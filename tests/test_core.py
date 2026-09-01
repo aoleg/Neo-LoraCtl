@@ -84,9 +84,9 @@ class TestBlockMask(unittest.TestCase):
                 mask = core.build_block_mask(self.COUNT, preset, modifier, 0.0)
                 self.assertEqual(mask, [1.0] * self.COUNT)
 
-    def test_bounds_for_all_combinations(self):
+    def test_one_sided_bounds(self):
         for preset in ("COMPOSITION", "CHARACTER", "STYLE"):
-            for modifier in core.MODIFIERS:
+            for modifier in ("Suppress", "Isolate"):
                 for contrast in (0.25, 0.5, 1.0):
                     mask = core.build_block_mask(self.COUNT, preset, modifier, contrast)
                     self.assertEqual(len(mask), self.COUNT)
@@ -94,29 +94,70 @@ class TestBlockMask(unittest.TestCase):
                         self.assertGreaterEqual(v, 1.0 - contrast - 1e-9)
                         self.assertLessEqual(v, 1.0 + 1e-9)
 
-    def test_emphasize_composition_shape(self):
-        mask = core.build_block_mask(self.COUNT, "COMPOSITION", "Emphasize", 1.0)
+    def test_isolate_composition_shape(self):
+        mask = core.build_block_mask(self.COUNT, "COMPOSITION", "Isolate", 1.0)
         self.assertAlmostEqual(mask[0], 1.0, places=6)   # inside zone
         self.assertAlmostEqual(mask[27], 0.0, places=6)  # deep outside
         self.assertLess(mask[12], mask[7])               # falls across shoulder
 
-    def test_suppress_mirrors_emphasize(self):
+    def test_suppress_mirrors_isolate(self):
         for preset in ("COMPOSITION", "CHARACTER", "STYLE"):
-            emph = core.build_block_mask(self.COUNT, preset, "Emphasize", 0.8)
+            iso = core.build_block_mask(self.COUNT, preset, "Isolate", 0.8)
             supp = core.build_block_mask(self.COUNT, preset, "Suppress", 0.8)
-            for e, s in zip(emph, supp):
-                self.assertAlmostEqual(e + s, 2.0 - 0.8, places=6)
+            for i, s in zip(iso, supp):
+                self.assertAlmostEqual(i + s, 2.0 - 0.8, places=6)
 
-    def test_character_zone_is_interior(self):
-        mask = core.build_block_mask(self.COUNT, "CHARACTER", "Emphasize", 1.0)
+    def test_isolate_character_zone_is_interior(self):
+        mask = core.build_block_mask(self.COUNT, "CHARACTER", "Isolate", 1.0)
         self.assertAlmostEqual(mask[14], 1.0, places=3)  # zone center
         self.assertAlmostEqual(mask[0], 0.0, places=6)
         self.assertAlmostEqual(mask[27], 0.0, places=6)
 
-    def test_style_zone_is_tail(self):
-        mask = core.build_block_mask(self.COUNT, "STYLE", "Emphasize", 1.0)
+    def test_isolate_style_zone_is_tail(self):
+        mask = core.build_block_mask(self.COUNT, "STYLE", "Isolate", 1.0)
         self.assertAlmostEqual(mask[27], 1.0, places=6)
         self.assertAlmostEqual(mask[0], 0.0, places=6)
+
+    def test_emphasize_is_mean_preserving(self):
+        # Exact conservation holds while the [0, MAX_FACTOR] clamp does not
+        # bind, i.e. amplitude a = contrast * boost <= 1 (peak <= 2.0).
+        for preset in ("COMPOSITION", "CHARACTER", "STYLE"):
+            for contrast in (0.25, 0.5, 0.7, 1.0):
+                for boost in (0.5, 1.0):
+                    if contrast * boost > 1.0:
+                        continue
+                    mask = core.build_block_mask(self.COUNT, preset, "Emphasize",
+                                                 contrast, boost)
+                    self.assertAlmostEqual(sum(mask) / self.COUNT, 1.0, places=9,
+                                           msg=f"{preset} c={contrast} b={boost}")
+
+    def test_emphasize_clamped_mean_dips_below_one(self):
+        # Past the clamp (a > 1) the peak saturates at MAX_FACTOR and the
+        # budget is no longer exactly conserved — documented behavior.
+        mask = core.build_block_mask(self.COUNT, "COMPOSITION", "Emphasize", 0.7, 1.5)
+        self.assertLess(sum(mask) / self.COUNT, 1.0)
+        self.assertAlmostEqual(max(mask), core.MAX_FACTOR, places=6)
+
+    def test_emphasize_is_a_bell(self):
+        mask = core.build_block_mask(self.COUNT, "CHARACTER", "Emphasize", 0.5, 1.0)
+        a = core.emphasize_amplitude(0.5, 1.0)
+        self.assertAlmostEqual(max(mask), 1.0 + a, places=6)   # peak in zone
+        self.assertGreater(mask[14], 1.0)                       # boosted center
+        self.assertLess(mask[0], 1.0)                           # lowered outside
+        self.assertLess(mask[27], 1.0)
+        self.assertGreater(min(mask), 0.5)                      # shallow floor
+
+    def test_emphasize_clamps_at_extremes(self):
+        mask = core.build_block_mask(self.COUNT, "CHARACTER", "Emphasize", 1.0, 2.0)
+        for v in mask:
+            self.assertGreaterEqual(v, 0.0)
+            self.assertLessEqual(v, core.MAX_FACTOR)
+
+    def test_emphasize_boost_scales_amplitude(self):
+        mild = core.build_block_mask(self.COUNT, "CHARACTER", "Emphasize", 0.5, 0.5)
+        strong = core.build_block_mask(self.COUNT, "CHARACTER", "Emphasize", 0.5, 1.5)
+        self.assertLess(max(mild), max(strong))
+        self.assertGreater(min(mild), min(strong))
 
 
 class TestKeyClassification(unittest.TestCase):
@@ -167,49 +208,91 @@ class TestTimeCurve(unittest.TestCase):
         self.assertEqual(core.TimeCurve("FLAT", "Emphasize", 1.0).factor(0.5), 1.0)
         self.assertEqual(core.TimeCurve("COMPOSITION", "Emphasize", 0.0).factor(0.5), 1.0)
 
-    def test_composition_emphasize(self):
-        curve = core.TimeCurve("COMPOSITION", "Emphasize", 1.0)
+    KREA_STEPS = [1.0, 0.9792, 0.9416, 0.8900, 0.8238, 0.7413, 0.6409,
+                  0.5229, 0.3901, 0.2518, 0.1251, 0.0339]
+
+    def test_composition_isolate(self):
+        curve = core.TimeCurve("COMPOSITION", "Isolate", 1.0)
         self.assertAlmostEqual(curve.factor(1.0), 1.0, places=6)    # start of run
         self.assertAlmostEqual(curve.factor(0.98), 1.0, places=6)
         self.assertAlmostEqual(curve.factor(0.90), 0.5, places=6)   # boundary midpoint
         self.assertAlmostEqual(curve.factor(0.20), 0.0, places=6)   # late steps
         self.assertAlmostEqual(curve.factor(0.0), 0.0, places=6)
 
-    def test_detail_emphasize(self):
-        curve = core.TimeCurve("DETAIL", "Emphasize", 1.0)
+    def test_detail_isolate(self):
+        curve = core.TimeCurve("DETAIL", "Isolate", 1.0)
         self.assertAlmostEqual(curve.factor(0.10), 1.0, places=6)
         self.assertAlmostEqual(curve.factor(0.50), 0.5, places=6)
         self.assertAlmostEqual(curve.factor(0.95), 0.0, places=6)
 
-    def test_character_is_interior(self):
-        curve = core.TimeCurve("CHARACTER", "Emphasize", 1.0)
+    def test_character_isolate_is_interior(self):
+        curve = core.TimeCurve("CHARACTER", "Isolate", 1.0)
         self.assertAlmostEqual(curve.factor(0.70), 1.0, places=6)
         self.assertAlmostEqual(curve.factor(1.0), 0.0, places=6)
         self.assertAlmostEqual(curve.factor(0.10), 0.0, places=6)
 
-    def test_suppress_mirrors_emphasize(self):
-        e = core.TimeCurve("CHARACTER", "Emphasize", 0.6)
+    def test_suppress_mirrors_isolate(self):
+        i = core.TimeCurve("CHARACTER", "Isolate", 0.6)
         s = core.TimeCurve("CHARACTER", "Suppress", 0.6)
         for sig in (0.0, 0.3, 0.5, 0.7, 0.9, 1.0):
-            self.assertAlmostEqual(e.factor(sig) + s.factor(sig), 2.0 - 0.6, places=6)
+            self.assertAlmostEqual(i.factor(sig) + s.factor(sig), 2.0 - 0.6, places=6)
 
     def test_adjacent_zones_partition(self):
         """COMPOSITION + CHARACTER + DETAIL windows sum to 1 at every sigma
-        (same boundaries and transition width), so emphasize presets tile the
+        (same boundaries and transition width), so Isolate presets tile the
         run without gaps or double coverage."""
-        curves = [core.TimeCurve(p, "Emphasize", 1.0) for p in ("COMPOSITION", "CHARACTER", "DETAIL")]
+        curves = [core.TimeCurve(p, "Isolate", 1.0) for p in ("COMPOSITION", "CHARACTER", "DETAIL")]
         for sig in (0.05, 0.35, 0.5, 0.62, 0.88, 0.9, 0.93, 1.0):
             total = sum(c.factor(sig) for c in curves)
             self.assertAlmostEqual(total, 1.0, places=6, msg=f"sigma={sig}")
 
-    def test_bounds(self):
+    def test_one_sided_bounds(self):
         for preset in ("COMPOSITION", "CHARACTER", "DETAIL"):
-            for modifier in core.MODIFIERS:
+            for modifier in ("Suppress", "Isolate"):
                 curve = core.TimeCurve(preset, modifier, 0.7)
                 for sig in (0.0, 0.2, 0.5, 0.9, 1.0):
                     f = curve.factor(sig)
                     self.assertGreaterEqual(f, 0.3 - 1e-9)
                     self.assertLessEqual(f, 1.0 + 1e-9)
+
+    def test_emphasize_prepared_mean_is_one(self):
+        """Step-weighted budget conservation on the real Krea 12-step
+        schedule: mean factor over the model-call steps == 1 exactly."""
+        for preset in ("COMPOSITION", "CHARACTER", "DETAIL"):
+            for boost in (0.5, 1.0, 1.5):
+                curve = core.TimeCurve(preset, "Emphasize", 0.5, boost=boost)
+                curve.prepare(self.KREA_STEPS)
+                factors = [curve.factor(s) for s in self.KREA_STEPS]
+                self.assertAlmostEqual(sum(factors) / len(factors), 1.0, places=9,
+                                       msg=f"{preset} boost={boost}")
+
+    def test_emphasize_boosts_zone_and_lowers_rest(self):
+        curve = core.TimeCurve("COMPOSITION", "Emphasize", 0.5, boost=1.0)
+        curve.prepare(self.KREA_STEPS)
+        self.assertGreater(curve.factor(1.0), 1.0)       # in zone: boosted
+        self.assertLess(curve.factor(0.25), 1.0)         # out of zone: lowered
+        self.assertGreater(curve.factor(0.25), 0.5)      # but shallow floor
+
+    def test_emphasize_unprepared_falls_back(self):
+        curve = core.TimeCurve("CHARACTER", "Emphasize", 0.5)
+        f = curve.factor(0.7)  # lazily computes a uniform-grid zone mean
+        self.assertGreater(f, 1.0)
+        self.assertIsNotNone(curve.zone_mean)
+
+    def test_emphasize_full_zone_degenerates_flat(self):
+        curve = core.TimeCurve("COMPOSITION", "Emphasize", 0.7,
+                               hi_boundary=0.01, transition=0.0)
+        curve.prepare([0.9, 0.5, 0.1])  # every step in-zone -> p = 1
+        for sig in (0.9, 0.5, 0.1):
+            self.assertAlmostEqual(curve.factor(sig), 1.0, places=9)
+
+    def test_emphasize_clamped_never_negative_or_above_max(self):
+        curve = core.TimeCurve("COMPOSITION", "Emphasize", 1.0, boost=2.0)
+        curve.prepare(self.KREA_STEPS)
+        for sig in self.KREA_STEPS:
+            f = curve.factor(sig)
+            self.assertGreaterEqual(f, 0.0)
+            self.assertLessEqual(f, core.MAX_FACTOR)
 
     def test_normalize_sigma(self):
         self.assertAlmostEqual(core.normalize_sigma(0.9, 1.0), 0.9)       # flow
@@ -253,7 +336,7 @@ class TestScheduleSet(unittest.TestCase):
 
     def _block_factor(self, key):
         idx = core.classify_key(key, core.ARCH_FLAT)
-        mask = core.build_block_mask(28, "STYLE", "Emphasize", 1.0)
+        mask = core.build_block_mask(28, "STYLE", "Isolate", 1.0)
         return 1.0 if idx is None else mask[idx]
 
     def test_collect_only_new_objects(self):

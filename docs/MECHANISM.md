@@ -10,7 +10,13 @@ Every scheduled LoRA patch gets its strength recomputed per sampling step:
 effective(key, sigma) = base_strength * block_factor(key) * time_factor(sigma / sigma0)
 ```
 
-`base_strength` is the prompt-tag strength. Both factors live in `[1 - contrast, 1]`, so an effective strength never exceeds what the prompt asked for. `sigma0` is the first sigma of the sampler's full schedule, making the time axis resolution- and step-count-independent on Forge Neo (whose Flux-family schedules run a fixed shift) and best-effort-portable to epsilon models.
+`base_strength` is the prompt-tag strength. `sigma0` is the first sigma of the sampler's full schedule, making the time axis resolution- and step-count-independent on Forge Neo (whose Flux-family schedules run a fixed shift) and best-effort-portable to epsilon models.
+
+Each factor comes from one of three modifiers:
+
+- **Suppress** dims the zone: factor in `[1 - contrast, 1]`, rest untouched.
+- **Isolate** keeps only the zone: zone at 1.0, rest in `[1 - contrast, 1]` (the pre-redesign "Emphasize" — live calibration showed this mode crosses the likeness strength threshold on character LoRAs at any useful contrast, so it is reserved for deliberate zone-only application, e.g. style transfer).
+- **Emphasize** is a mean-preserving redistribution: `factor = 1 + a*(w - p)/(1 - p)` with amplitude `a = contrast * boost` and `p` the window's mean over the evaluated domain — the zone rises above 1, the rest drops below, and the average stays exactly 1, so the prompt-tag strength acts as a conserved budget. `p` is computed over the classified blocks (block axis) and, once the schedule is captured, over the **full schedule's actual model-call steps** (time axis; `TimeCurve.prepare`) — conserving over the full schedule keeps img2img/hires slices on the same absolute curve. All factors clamp to `[0, 2]`; the clamp binding (`a > 1`) is the one case where conservation bends.
 
 ## Integration points
 
@@ -39,7 +45,7 @@ Patch keys are model state-dict keys (`diffusion_model.<module>.weight`). Classi
 
 Krea 2's text-fusion modules (`txtfusion.layerwise_blocks.N`, `.refiner_blocks.N`) and non-block modules (`first`, `last`, `tmlp`, `txtmlp`, `tproj`) are explicitly outside the block axis: their factor is pinned to 1.0. The anchored match makes the `layerwise_blocks` collision (which broke another extension's mapping) structurally impossible.
 
-Zone masks are even thirds of the block index space with smoothstep shoulders (fixed 2.5-block width) evaluated at block centers; time zones use smoothstep ramps straddling the sigma boundaries (defaults 0.90 / 0.50, provisional pending calibration). Adjacent emphasize zones tile to exactly 1.0.
+Zone masks are even thirds of the block index space with smoothstep shoulders (fixed 2.5-block width) evaluated at block centers; time zones use smoothstep ramps straddling the sigma boundaries (defaults 0.90 / 0.50, provisional pending calibration). Adjacent zone windows tile to exactly 1.0 (visible directly in Isolate at contrast 1).
 
 ## Dev mode
 

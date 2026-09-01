@@ -123,6 +123,7 @@ class NeoLoraCtlScript(scripts.Script):
     block_preset: str = "FULL"
     block_modifier: str = "Emphasize"
     block_contrast: float = 0.0
+    block_boost: float = 1.0
     dev_mask_text: str = ""
     debug: bool = False
 
@@ -198,7 +199,8 @@ class NeoLoraCtlScript(scripts.Script):
             _log(f"DEV: block mask override ignored (need exactly "
                  f"{cls.block_count} numeric values)")
         return core.build_block_mask(cls.block_count, cls.block_preset,
-                                     cls.block_modifier, cls.block_contrast)
+                                     cls.block_modifier, cls.block_contrast,
+                                     cls.block_boost)
 
     @classmethod
     def block_factor_for_key(cls, key):
@@ -232,6 +234,8 @@ class NeoLoraCtlScript(scripts.Script):
                 block_modifier = gr.Radio(choices=list(core.MODIFIERS), value="Emphasize",
                                           label="Modifier")
                 block_contrast = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Contrast")
+                block_boost = gr.Slider(0.25, 2.0, value=1.0, step=0.05,
+                                        label="Boost (Emphasize)")
             gr.Markdown("**Timesteps** — when in the run the LoRA applies")
             with gr.Row():
                 time_preset = gr.Dropdown(choices=list(core.TIME_PRESETS), value="FLAT",
@@ -239,6 +243,8 @@ class NeoLoraCtlScript(scripts.Script):
                 time_modifier = gr.Radio(choices=list(core.MODIFIERS), value="Emphasize",
                                          label="Modifier")
                 time_contrast = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Contrast")
+                time_boost = gr.Slider(0.25, 2.0, value=1.0, step=0.05,
+                                       label="Boost (Emphasize)")
             te_enabled = gr.Checkbox(
                 label="Apply text-encoder half of scheduled LoRAs (at prompt strength)",
                 value=True)
@@ -257,13 +263,14 @@ class NeoLoraCtlScript(scripts.Script):
                 dev_bounds = gr.Textbox(value="", label="DEV: time boundaries hi,lo",
                                         placeholder=f"{core.DEFAULT_TIME_HI_BOUNDARY},"
                                                     f"{core.DEFAULT_TIME_LO_BOUNDARY}")
-        return [enabled, block_preset, block_modifier, block_contrast,
-                time_preset, time_modifier, time_contrast,
+        return [enabled, block_preset, block_modifier, block_contrast, block_boost,
+                time_preset, time_modifier, time_contrast, time_boost,
                 te_enabled, filter_mode, filter_patterns, debug, dev_mask, dev_bounds]
 
     def process(self, p, enabled=False, block_preset="FULL", block_modifier="Emphasize",
-                block_contrast=0.7, time_preset="FLAT", time_modifier="Emphasize",
-                time_contrast=0.7, te_enabled=True, filter_mode="exclude",
+                block_contrast=0.7, block_boost=1.0, time_preset="FLAT",
+                time_modifier="Emphasize", time_contrast=0.7, time_boost=1.0,
+                te_enabled=True, filter_mode="exclude",
                 filter_patterns="", debug=False, dev_mask="", dev_bounds="", *args):
         cls = NeoLoraCtlScript
         cls.enabled = bool(enabled) and _install_interception()
@@ -282,9 +289,11 @@ class NeoLoraCtlScript(scripts.Script):
         block_preset = getattr(p, "loractl_xyz_block_preset", block_preset)
         block_modifier = getattr(p, "loractl_xyz_block_modifier", block_modifier)
         block_contrast = getattr(p, "loractl_xyz_block_contrast", block_contrast)
+        block_boost = getattr(p, "loractl_xyz_block_boost", block_boost)
         time_preset = getattr(p, "loractl_xyz_time_preset", time_preset)
         time_modifier = getattr(p, "loractl_xyz_time_modifier", time_modifier)
         time_contrast = getattr(p, "loractl_xyz_time_contrast", time_contrast)
+        time_boost = getattr(p, "loractl_xyz_time_boost", time_boost)
         time_hi = getattr(p, "loractl_xyz_time_hi", None)
         time_lo = getattr(p, "loractl_xyz_time_lo", None)
 
@@ -312,17 +321,19 @@ class NeoLoraCtlScript(scripts.Script):
             preset=time_preset if time_preset in core.TIME_PRESETS else "FLAT",
             modifier=time_modifier if time_modifier in core.MODIFIERS else "Emphasize",
             contrast=float(time_contrast),
+            boost=float(time_boost),
             hi_boundary=hi, lo_boundary=lo,
         )
 
         block_sig = (str(block_preset), str(block_modifier), float(block_contrast),
-                     str(dev_mask))
+                     float(block_boost), str(dev_mask))
         if block_sig != cls.block_sig:
             cls.block_sig = block_sig
             cls.block_preset = block_preset if block_preset in core.BLOCK_PRESETS else "FULL"
             cls.block_modifier = (block_modifier if block_modifier in core.MODIFIERS
                                   else "Emphasize")
             cls.block_contrast = float(block_contrast)
+            cls.block_boost = float(block_boost)
             cls.dev_mask_text = str(dev_mask)
             cls.block_mask = None  # rebuild lazily (count may be unknown yet)
             if cls.sched.entries and cls.block_count:
@@ -333,10 +344,15 @@ class NeoLoraCtlScript(scripts.Script):
                     _log("block config changed; rebound factors on "
                          f"{len(cls.sched.entries)} entries")
 
-        p.extra_generation_params["LoraCtl blocks"] = (
-            f"{cls.block_preset}/{cls.block_modifier}/{cls.block_contrast:g}")
-        p.extra_generation_params["LoraCtl time"] = (
-            f"{cls.time_curve.preset}/{cls.time_curve.modifier}/{cls.time_curve.contrast:g}")
+        block_desc = f"{cls.block_preset}/{cls.block_modifier}/{cls.block_contrast:g}"
+        if cls.block_modifier == "Emphasize":
+            block_desc += f"/x{cls.block_boost:g}"
+        time_desc = (f"{cls.time_curve.preset}/{cls.time_curve.modifier}"
+                     f"/{cls.time_curve.contrast:g}")
+        if cls.time_curve.modifier == "Emphasize":
+            time_desc += f"/x{cls.time_curve.boost:g}"
+        p.extra_generation_params["LoraCtl blocks"] = block_desc
+        p.extra_generation_params["LoraCtl time"] = time_desc
         if (hi, lo) != (core.DEFAULT_TIME_HI_BOUNDARY, core.DEFAULT_TIME_LO_BOUNDARY):
             p.extra_generation_params["LoraCtl bounds"] = f"{hi:g},{lo:g}"
         p.extra_generation_params["LoraCtl TE"] = "on" if cls.te_enabled else "off"
@@ -412,6 +428,11 @@ class NeoLoraCtlScript(scripts.Script):
                 schedule = [float(s) for s in sigmas]
                 cls.sigma0 = schedule[0]
                 cls.captured_schedule = schedule
+                if cls.sigma0 > 0.0:
+                    # Emphasize budget: conserve the mean over this pass's
+                    # actual model-call steps (schedule[:-1]).
+                    cls.time_curve.zone_mean = None
+                    cls.time_curve.prepare([s / cls.sigma0 for s in schedule[:-1]])
                 if cls.debug:
                     lo, hi = cls.time_curve.lo_boundary, cls.time_curve.hi_boundary
                     _log(f"schedule captured ({len(schedule) - 1} steps): "
@@ -502,13 +523,15 @@ def _register_xyz_axes():
         choice("Block preset", "loractl_xyz_block_preset", core.BLOCK_PRESETS),
         choice("Block modifier", "loractl_xyz_block_modifier", core.MODIFIERS),
         number("Block contrast", "loractl_xyz_block_contrast"),
+        number("Block boost", "loractl_xyz_block_boost"),
         choice("Time preset", "loractl_xyz_time_preset", core.TIME_PRESETS),
         choice("Time modifier", "loractl_xyz_time_modifier", core.MODIFIERS),
         number("Time contrast", "loractl_xyz_time_contrast"),
+        number("Time boost", "loractl_xyz_time_boost"),
         number("Time hi boundary", "loractl_xyz_time_hi"),
         number("Time lo boundary", "loractl_xyz_time_lo"),
     ])
-    _log("registered 8 XYZ grid axes")
+    _log("registered 10 XYZ grid axes")
 
 
 on_before_ui(_register_xyz_axes)

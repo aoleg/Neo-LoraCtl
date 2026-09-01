@@ -34,17 +34,18 @@ Add LoRAs to your prompt as usual (`<lora:my_character:0.8>`), open the **Neo-Lo
 | `CHARACTER` | Middle steps, where subjects take shape. |
 | `DETAIL` | Late steps, where fine detail and style are rendered. |
 
-### Modifier and Contrast
+### Modifier, Contrast, and Boost
 
-Each axis has a modifier and a contrast slider:
+Each axis has a modifier, a contrast slider, and (for Emphasize) a boost slider:
 
-- **Emphasize**: the LoRA runs at full prompt strength inside the chosen zone and is attenuated outside it.
-- **Suppress**: the LoRA is attenuated inside the zone and runs at full strength everywhere else.
-- **Contrast** sets how deep the attenuation goes: `0` = no effect at all, `1` = fully off in the attenuated region. Values around `0.6-0.8` are a good start; hard masking (`1.0`) can degrade LoRAs whose blocks depend on each other.
+- **Emphasize** redistributes: the LoRA runs *stronger than your prompt strength* inside the chosen zone and correspondingly weaker outside it, with the average across the run/model staying exactly at your prompt strength. **Boost** scales how tall the bell is (`1` = normal, `2` = twice the amplitude, `0.5` = gentle).
+- **Suppress**: the LoRA is attenuated inside the zone and runs at full strength everywhere else. The go-to modifier for removing something (style bleed, face distortion) while keeping the rest intact.
+- **Isolate**: the LoRA applies *only* in the zone — full strength there, attenuated everywhere else. Deliberately drastic; useful for zone-only work like pure style transfer. Expect character likeness to drop: identity needs most of the model at near-full strength.
+- **Contrast** sets how far factors move from neutral: `0` = no effect at all, `1` = maximum. For Suppress/Isolate that is the attenuation depth; for Emphasize it scales the bell together with Boost.
 
-The two axes multiply, so `CHARACTER` blocks x `CHARACTER` timesteps narrows a LoRA down hard, and a strength never exceeds what your `<lora:...:s>` tag asked for.
+The two axes multiply. Emphasize can push a zone above your `<lora:...:s>` strength (capped at 2x); very strong boosts can overbake a LoRA — if results look fried, lower Boost before lowering strength.
 
-Typical recipes: a character LoRA that drags its training style into everything — blocks `STYLE` + `Suppress`; a style LoRA that deforms faces — blocks `CHARACTER` + `Suppress`, or timesteps `DETAIL` + `Emphasize`.
+Typical recipes: a character LoRA that drags its training style into everything — blocks `STYLE` + `Suppress` (raise the LoRA's prompt strength a notch to compensate, which can even recover features the trainer masked out); a style LoRA that deforms faces — blocks `CHARACTER` + `Suppress`; gently favoring identity — timesteps `COMPOSITION` + `Emphasize` at moderate contrast.
 
 ### Filter
 
@@ -60,7 +61,7 @@ No settings needed: scheduling is anchored to the sampler's actual noise level, 
 
 ### XYZ grid
 
-Eight axes are registered under `(LoraCtl) ...` — both presets, modifiers, contrasts, and the two timestep zone boundaries — so you can sweep any of them systematically.
+Ten axes are registered under `(LoraCtl) ...` — both presets, modifiers, contrasts, boosts, and the two timestep zone boundaries — so you can sweep any of them systematically.
 
 ### Reproducibility
 

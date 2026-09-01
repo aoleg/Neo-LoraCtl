@@ -221,8 +221,9 @@ def _load_script(networks_mod):
 
 
 UI_DEFAULTS = dict(enabled=True, block_preset="FULL", block_modifier="Emphasize",
-                   block_contrast=1.0, time_preset="FLAT", time_modifier="Emphasize",
-                   time_contrast=1.0, te_enabled=True, filter_mode="exclude",
+                   block_contrast=1.0, block_boost=1.0, time_preset="FLAT",
+                   time_modifier="Emphasize", time_contrast=1.0, time_boost=1.0,
+                   te_enabled=True, filter_mode="exclude",
                    filter_patterns=core.DEFAULT_EXCLUDE_PATTERNS, debug=False,
                    dev_mask="", dev_bounds="")
 
@@ -320,7 +321,7 @@ class TestInterceptionRouting(unittest.TestCase):
         p, _ = h.generate(["charA.safetensors"],
                           ui={"time_preset": "COMPOSITION", "time_contrast": 0.5})
         self.assertEqual(p.extra_generation_params["LoraCtl time"],
-                         "COMPOSITION/Emphasize/0.5")
+                         "COMPOSITION/Emphasize/0.5/x1")
         self.assertIn("LoraCtl filter", p.extra_generation_params)
 
 
@@ -336,7 +337,8 @@ class TestScheduling(unittest.TestCase):
     def test_composition_emphasize_drives_strengths(self):
         h = Harness()
         _, per_step = h.generate(["charA.safetensors"], strengths=[0.5],
-                                 ui={"time_preset": "COMPOSITION", "time_contrast": 1.0})
+                                 ui={"time_preset": "COMPOSITION", "time_contrast": 1.0,
+                                     "time_modifier": "Isolate"})
         first, last = per_step[0], per_step[-1]
         for name in first:
             self.assertAlmostEqual(first[name], 0.5, places=6)   # sigma 1.0 in zone
@@ -368,7 +370,8 @@ class TestScheduling(unittest.TestCase):
         sched = [14.6, 9.0, 5.0, 2.5, 1.0, 0.3, 0.0]
         h = Harness()
         _, per_step = h.generate(["charA.safetensors"], strengths=[0.5],
-                                 ui={"time_preset": "COMPOSITION", "time_contrast": 1.0},
+                                 ui={"time_preset": "COMPOSITION", "time_contrast": 1.0,
+                                     "time_modifier": "Isolate"},
                                  steps_schedule=sched)
         self.assertAlmostEqual(h.cls().sigma0, 14.6)
         first = per_step[0]
@@ -448,7 +451,7 @@ class TestApiDrift(unittest.TestCase):
                 self.assertAlmostEqual(s, 0.5, places=9)
 
 
-STYLE_MASK = core.build_block_mask(28, "STYLE", "Emphasize", 1.0)
+STYLE_MASK = core.build_block_mask(28, "STYLE", "Isolate", 1.0)
 
 
 class TestBlockAxis(unittest.TestCase):
@@ -478,8 +481,10 @@ class TestBlockAxis(unittest.TestCase):
         h = Harness()
         _, per_step = h.generate(["charA.safetensors"], strengths=[0.5],
                                  ui={"block_preset": "STYLE", "block_contrast": 1.0,
-                                     "time_preset": "COMPOSITION", "time_contrast": 1.0})
-        curve = core.TimeCurve("COMPOSITION", "Emphasize", 1.0)
+                                     "block_modifier": "Isolate",
+                                     "time_preset": "COMPOSITION", "time_contrast": 1.0,
+                                     "time_modifier": "Isolate"})
+        curve = core.TimeCurve("COMPOSITION", "Isolate", 1.0)
         for sigma, step in zip(KREA_SCHEDULE[:-1], per_step):
             tf = curve.factor(core.normalize_sigma(sigma, 1.0))
             self.assertAlmostEqual(
@@ -498,7 +503,8 @@ class TestBlockAxis(unittest.TestCase):
         h.generate(["charA.safetensors"], strengths=[0.5], ui={"block_preset": "FULL"})
         self.assertEqual(len(h.networks.calls), 1)
         h.generate(["charA.safetensors"], strengths=[0.5],
-                   ui={"block_preset": "STYLE", "block_contrast": 1.0})
+                   ui={"block_preset": "STYLE", "block_contrast": 1.0,
+                       "block_modifier": "Isolate"})
         self.assertEqual(len(h.networks.calls), 1)  # no reload happened
         parked = h.snapshot_strengths()  # postprocess parks at base * block
         self.assertAlmostEqual(
@@ -521,6 +527,49 @@ class TestBlockAxis(unittest.TestCase):
             0.5 * (1.0 - STYLE_MASK[20]), places=6)
 
 
+class TestEmphasizeRedistribution(unittest.TestCase):
+    def test_step_weighted_mean_is_one(self):
+        """End-to-end budget conservation: with the schedule captured and
+        prepared, the mean applied factor over all model-call steps is 1."""
+        h = Harness()
+        _, per_step = h.generate(["charA.safetensors"], strengths=[0.5],
+                                 ui={"time_preset": "CHARACTER",
+                                     "time_contrast": 0.5})
+        name = "diffusion_model.blocks.20.mlp.0.weight#0"
+        factors = [step[name] / 0.5 for step in per_step]
+        self.assertAlmostEqual(sum(factors) / len(factors), 1.0, places=6)
+        self.assertGreater(max(factors), 1.0)   # zone boosted
+        self.assertLess(min(factors), 1.0)      # rest lowered
+
+    def test_boost_deepens_the_bell(self):
+        h1 = Harness()
+        _, per1 = h1.generate(["charA.safetensors"], strengths=[0.5],
+                              ui={"time_preset": "CHARACTER", "time_contrast": 0.5,
+                                  "time_boost": 0.5})
+        h2 = Harness()
+        _, per2 = h2.generate(["charA.safetensors"], strengths=[0.5],
+                              ui={"time_preset": "CHARACTER", "time_contrast": 0.5,
+                                  "time_boost": 2.0})
+        name = "diffusion_model.blocks.20.mlp.0.weight#0"
+        self.assertLess(max(s[name] for s in per1), max(s[name] for s in per2))
+
+    def test_block_emphasize_mask_mean_is_one(self):
+        h = Harness()
+        h.generate(["charA.safetensors"], strengths=[0.5],
+                   ui={"block_preset": "CHARACTER", "block_contrast": 0.5})
+        mask = h.cls().block_mask
+        self.assertEqual(len(mask), 28)
+        self.assertAlmostEqual(sum(mask) / len(mask), 1.0, places=9)
+
+    def test_infotext_carries_boost(self):
+        h = Harness()
+        p, _ = h.generate(["charA.safetensors"],
+                          ui={"block_preset": "CHARACTER", "block_contrast": 0.5,
+                              "block_boost": 1.5})
+        self.assertEqual(p.extra_generation_params["LoraCtl blocks"],
+                         "CHARACTER/Emphasize/0.5/x1.5")
+
+
 class TestXYZOverrides(unittest.TestCase):
     def test_p_attributes_override_ui(self):
         h = Harness()
@@ -529,9 +578,11 @@ class TestXYZOverrides(unittest.TestCase):
             ui={"time_preset": "FLAT", "block_preset": "FULL"},
             p_attrs={"loractl_xyz_time_preset": "COMPOSITION",
                      "loractl_xyz_time_contrast": 1.0,
+                     "loractl_xyz_time_modifier": "Isolate",
                      "loractl_xyz_block_preset": "STYLE",
-                     "loractl_xyz_block_contrast": 1.0})
-        curve = core.TimeCurve("COMPOSITION", "Emphasize", 1.0)
+                     "loractl_xyz_block_contrast": 1.0,
+                     "loractl_xyz_block_modifier": "Isolate"})
+        curve = core.TimeCurve("COMPOSITION", "Isolate", 1.0)
         tf_last = curve.factor(core.normalize_sigma(KREA_SCHEDULE[-2], 1.0))
         self.assertAlmostEqual(
             per_step[-1]["diffusion_model.blocks.27.mlp.0.weight#0"]
@@ -543,7 +594,8 @@ class TestXYZOverrides(unittest.TestCase):
         h = Harness()
         _, per_step = h.generate(
             ["charA.safetensors"], strengths=[0.5],
-            ui={"time_preset": "COMPOSITION", "time_contrast": 1.0},
+            ui={"time_preset": "COMPOSITION", "time_contrast": 1.0,
+                "time_modifier": "Isolate"},
             p_attrs={"loractl_xyz_time_hi": 0.70})
         # sigma 0.7595 is above the moved 0.70 boundary -> full strength;
         # with the default 0.90 boundary it would be attenuated to ~0.
@@ -572,12 +624,12 @@ class TestXYZOverrides(unittest.TestCase):
         for cb in _before_ui_callbacks:
             cb()
         labels = [o.label for o in xyz_mod.axis_options]
-        self.assertEqual(len(labels), 8)
+        self.assertEqual(len(labels), 10)
         self.assertIn("(LoraCtl) Time preset", labels)
         self.assertIn("(LoraCtl) Block contrast", labels)
         for cb in _before_ui_callbacks:  # re-registration guard
             cb()
-        self.assertEqual(len(xyz_mod.axis_options), 8)
+        self.assertEqual(len(xyz_mod.axis_options), 10)
         # The applied field lands where process() reads it.
         opt = next(o for o in xyz_mod.axis_options if o.label == "(LoraCtl) Time preset")
         p = types.SimpleNamespace()

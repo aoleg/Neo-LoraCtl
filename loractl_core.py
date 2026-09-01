@@ -24,7 +24,17 @@ PATCH_TUPLE_LEN = 5
 
 BLOCK_PRESETS = ("FULL", "COMPOSITION", "CHARACTER", "STYLE")
 TIME_PRESETS = ("FLAT", "COMPOSITION", "CHARACTER", "DETAIL")
-MODIFIERS = ("Emphasize", "Suppress")
+
+# Emphasize: mean-preserving redistribution — boosts the zone above the
+# prompt strength and lowers the rest so the average stays exactly 1.
+# Suppress: dims the zone, rest untouched. Isolate: zone at full strength,
+# rest dimmed (the pre-redesign "Emphasize"; kept under an honest name for
+# zone-only application of e.g. style LoRAs).
+MODIFIERS = ("Emphasize", "Suppress", "Isolate")
+
+# Hard cap on any strength factor (Emphasize can exceed 1; unbounded boosts
+# overbake LoRAs). Floors clamp at 0.
+MAX_FACTOR = 2.0
 
 # Provisional Krea 2 defaults (normalized sigma). The COMPOSITION/rest
 # boundary comes from the SPEED calibration (knowledge_speed.md §11); the
@@ -92,11 +102,31 @@ def _window(x: float, lo: float | None, hi: float | None, width: float) -> float
 
 
 def _apply_modifier(w: float, modifier: str, contrast: float) -> float:
-    """Map zone membership w to a strength factor in [1 - contrast, 1]."""
+    """One-sided modifiers: map zone membership w to a factor in
+    [1 - contrast, 1]. Emphasize is NOT handled here — it needs the zone's
+    domain mean (see _emphasize_factor)."""
     c = min(max(contrast, 0.0), 1.0)
     if modifier == "Suppress":
         return 1.0 - c * w
-    return 1.0 - c * (1.0 - w)  # Emphasize
+    return 1.0 - c * (1.0 - w)  # Isolate
+
+
+def emphasize_amplitude(contrast: float, boost: float) -> float:
+    """Bell amplitude a = contrast * boost, clamped to [0, MAX_FACTOR]."""
+    return min(max(contrast, 0.0) * max(boost, 0.0), MAX_FACTOR)
+
+
+def _emphasize_factor(w: float, p: float, a: float) -> float:
+    """Mean-preserving redistribution: factor = 1 + a*(w - p)/(1 - p), where
+    p is the mean of the window over the evaluated domain. Peak 1+a in-zone,
+    floor 1 - a*p/(1-p) outside; the domain mean is exactly 1 unless the
+    [0, MAX_FACTOR] clamp binds. p ~ 1 (zone covers everything) degenerates
+    to a flat 1.0 — a uniform boost would break conservation."""
+    if a <= 0.0 or p >= 1.0 - 1e-6:
+        return 1.0
+    p = max(p, 0.0)
+    factor = 1.0 + a * (w - p) / (1.0 - p)
+    return min(max(factor, 0.0), MAX_FACTOR)
 
 
 # ---------------------------------------------------------------------------
@@ -116,17 +146,23 @@ def block_zone(preset: str, count: int) -> tuple[float | None, float | None]:
 
 
 def build_block_mask(count: int, preset: str, modifier: str, contrast: float,
+                     boost: float = 1.0,
                      shoulder: float = DEFAULT_BLOCK_SHOULDER) -> list[float]:
-    """Per-block factor, evaluated at block centers (index + 0.5)."""
+    """Per-block factor, evaluated at block centers (index + 0.5).
+
+    Emphasize masks are mean-preserving over the `count` classified blocks
+    (non-block keys sit outside the mask at 1.0 and outside the budget)."""
     if count < 1:
         raise ValueError("block count must be >= 1")
     if preset == "FULL" or contrast <= 0.0:
         return [1.0] * count
     lo, hi = block_zone(preset, count)
-    return [
-        _apply_modifier(_window(i + 0.5, lo, hi, shoulder), modifier, contrast)
-        for i in range(count)
-    ]
+    windows = [_window(i + 0.5, lo, hi, shoulder) for i in range(count)]
+    if modifier == "Emphasize":
+        p = sum(windows) / count
+        a = emphasize_amplitude(contrast, boost)
+        return [_emphasize_factor(w, p, a) for w in windows]
+    return [_apply_modifier(w, modifier, contrast) for w in windows]
 
 
 # ---------------------------------------------------------------------------
@@ -235,9 +271,11 @@ class TimeCurve:
     preset: str = "FLAT"
     modifier: str = "Emphasize"
     contrast: float = 0.0
+    boost: float = 1.0
     hi_boundary: float = DEFAULT_TIME_HI_BOUNDARY
     lo_boundary: float = DEFAULT_TIME_LO_BOUNDARY
     transition: float = DEFAULT_TIME_TRANSITION
+    zone_mean: float | None = None  # p for Emphasize; set by prepare()
 
     def zone(self) -> tuple[float | None, float | None]:
         if self.preset == "COMPOSITION":
@@ -248,13 +286,36 @@ class TimeCurve:
             return None, self.lo_boundary
         raise ValueError(f"unknown time preset: {self.preset}")
 
+    def _window_at(self, sigma_norm: float) -> float:
+        lo, hi = self.zone()
+        return _window(sigma_norm, lo, hi, self.transition)
+
+    def prepare(self, step_sigmas_norm) -> None:
+        """Fix the Emphasize budget to the actual run: p = mean window over
+        the FULL schedule's model-call sigmas (normalized). Conserving over
+        the full schedule (not an img2img/hires slice) keeps partial passes
+        on the same absolute curve. No-op for other modifiers/presets."""
+        if self.preset == "FLAT" or not step_sigmas_norm:
+            return
+        windows = [self._window_at(s) for s in step_sigmas_norm]
+        self.zone_mean = sum(windows) / len(windows)
+
+    def _default_zone_mean(self) -> float:
+        # Fallback when no schedule was captured: uniform grid over (0, 1].
+        n = 200
+        return sum(self._window_at((i + 1) / n) for i in range(n)) / n
+
     def factor(self, sigma_norm: float) -> float:
         """Strength factor at a normalized sigma (sigma / full-schedule
         sigma[0]); high sigma = early in the run."""
         if self.preset == "FLAT" or self.contrast <= 0.0:
             return 1.0
-        lo, hi = self.zone()
-        w = _window(sigma_norm, lo, hi, self.transition)
+        w = self._window_at(sigma_norm)
+        if self.modifier == "Emphasize":
+            if self.zone_mean is None:
+                self.zone_mean = self._default_zone_mean()
+            a = emphasize_amplitude(self.contrast, self.boost)
+            return _emphasize_factor(w, self.zone_mean, a)
         return _apply_modifier(w, self.modifier, self.contrast)
 
 
