@@ -69,10 +69,27 @@ def _install_interception():
     return True
 
 
+def _builtin_ctl_mapping():
+    """Forge >= c2ae52e5 ships 'LoRA Control Integrated' (prompt syntax
+    <lora:name:[a:b]>), which drives patch strengths per step itself. Its
+    class-level mapping (keyed by LoRA filename) tells us which LoRAs it
+    owns this run; we must not fight it over the same objects."""
+    for data in getattr(scripts, "scripts_data", []):
+        if getattr(data.script_class, "__name__", "") == "LoRAControl":
+            return getattr(data.script_class, "mapping", {})
+    return {}
+
+
 def _intercepted_load_lora_for_models(model, clip, lora, strength_model, strength_clip,
                                       filename="default", online_mode=False):
     cls = NeoLoraCtlScript
     if not cls.enabled or not core.lora_is_scheduled(filename, cls.patterns, cls.filter_mode):
+        return _original_load_lora_for_models(model, clip, lora, strength_model,
+                                              strength_clip, filename, online_mode)
+    if filename in _builtin_ctl_mapping():
+        if cls.debug:
+            _log(f"'{os.path.basename(filename)}' uses <lora:...:[a:b]> syntax; "
+                 "left to Forge's builtin LoRA Control")
         return _original_load_lora_for_models(model, clip, lora, strength_model,
                                               strength_clip, filename, online_mode)
 

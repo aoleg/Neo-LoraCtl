@@ -90,9 +90,10 @@ def _fake_modules():
 # ---------------------------------------------------------------------------
 
 class FakeOnlineLoRAPatch:
-    def __init__(self, key, patch_tuple):
+    def __init__(self, key, patch_entry, name=""):
+        self.name = name
         self.key = key
-        self.patch = [patch_tuple]
+        self.patch = [patch_entry]
 
     def __call__(self, weight):
         return weight + self.patch[0][0]
@@ -110,6 +111,8 @@ class FakeInnerModel:
 
 
 class FakePatcher:
+    payload_form = tuple  # tuple at 92b55e1b, list from c2ae52e5 on
+
     def __init__(self, n_blocks=28):
         self.patches = {}
         self.weight_wrapper_patches = {}
@@ -122,14 +125,14 @@ class FakePatcher:
         n.model = self.model
         return n
 
-    def add_patches(self, keys, strength, online_mode, tuple_len=5):
+    def add_patches(self, keys, strength, online_mode, tuple_len=5, filename=""):
         for key in keys:
             if tuple_len == 5:
-                t = (strength, object(), 1.0, None, None)
+                t = FakePatcher.payload_form((strength, object(), 1.0, None, None))
             else:
                 t = (strength, object(), 1.0, None, None, True)
             if online_mode:
-                obj = FakeOnlineLoRAPatch(key, t)
+                obj = FakeOnlineLoRAPatch(key, t, name=filename)
                 self.weight_wrapper_patches[key] = self.weight_wrapper_patches.get(key, []) + [obj]
             else:
                 cur = self.patches.pop(key, [])
@@ -157,7 +160,7 @@ def _fake_networks(tuple_len=5):
                                "strength_clip": strength_clip})
         new_model = model.clone()
         new_model.add_patches(LORA_KEYS[os.path.basename(filename)], strength_model,
-                              online_mode, tuple_len=tuple_len)
+                              online_mode, tuple_len=tuple_len, filename=filename)
         return new_model, clip
 
     networks.load_lora_for_models = load_lora_for_models
@@ -568,6 +571,53 @@ class TestEmphasizeRedistribution(unittest.TestCase):
                               "block_boost": 1.5})
         self.assertEqual(p.extra_generation_params["LoraCtl blocks"],
                          "CHARACTER/Emphasize/0.5/x1.5")
+
+
+class TestNewBuildCompat(unittest.TestCase):
+    """Forge c2ae52e5+: list payloads, .name attribution, builtin LoRA Control."""
+
+    def setUp(self):
+        FakePatcher.payload_form = list
+
+    def tearDown(self):
+        FakePatcher.payload_form = tuple
+
+    def test_flat_oracle_on_list_payloads(self):
+        h = Harness()
+        _, per_step = h.generate(["charA.safetensors"], strengths=[0.5])
+        self.assertEqual(len(h.cls().sched.entries), 3)
+        for step in per_step:
+            for name, val in step.items():
+                self.assertAlmostEqual(val, 0.5, places=9, msg=name)
+
+    def test_scheduling_drives_list_payloads_in_place(self):
+        h = Harness()
+        _, per_step = h.generate(["charA.safetensors"], strengths=[0.5],
+                                 ui={"time_preset": "COMPOSITION", "time_contrast": 1.0,
+                                     "time_modifier": "Isolate"})
+        for val in per_step[-1].values():
+            self.assertAlmostEqual(val, 0.0, places=6)
+        unet = h.sd_model.forge_objects.unet
+        for objs in unet.weight_wrapper_patches.values():
+            for obj in objs:
+                self.assertIs(type(obj.patch[0]), list)
+
+    def test_builtin_ctl_loras_left_alone(self):
+        h = Harness()
+        ctl_mapping = {"charA.safetensors": [0.2, 0.9, None]}
+        entry = types.SimpleNamespace(
+            script_class=type("LoRAControl", (), {"mapping": ctl_mapping}),
+            module=None)
+        sys.modules["modules.scripts"].scripts_data.append(entry)
+        try:
+            h.generate(["charA.safetensors", "styleB.safetensors"])
+            self.assertEqual(h.cls().scheduled_files, ["styleB.safetensors"])
+            by_file = {os.path.basename(c["filename"]): c for c in h.networks.calls}
+            # charA passes through with the ORIGINAL online_mode (False here).
+            self.assertEqual(by_file["charA.safetensors"]["online_mode"], False)
+            self.assertEqual(by_file["styleB.safetensors"]["online_mode"], True)
+        finally:
+            sys.modules["modules.scripts"].scripts_data.remove(entry)
 
 
 class TestXYZOverrides(unittest.TestCase):

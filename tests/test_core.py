@@ -17,21 +17,24 @@ import loractl_core as core
 
 
 class FakeOnlineLoRAPatch:
-    """Mirror of backend/patcher/base.py::OnlineLoRAPatch at 92b55e1b."""
+    """Mirror of backend/patcher/base.py::OnlineLoRAPatch. The payload is a
+    tuple at 92b55e1b and a mutable list (with a .name filename attribute)
+    from c2ae52e5 on; both forms must work."""
 
-    def __init__(self, key, patch_tuple):
+    def __init__(self, key, patch_entry, name=""):
+        self.name = name
         self.key = key
-        self.patch = [patch_tuple]
+        self.patch = [patch_entry]
 
     def __call__(self, weight):
-        # Fake merge: consume the CURRENT tuple strength, like
+        # Fake merge: consume the CURRENT payload strength, like
         # merge_lora_to_weight re-reading self.patch per forward.
         strength = self.patch[0][0]
         return weight + strength
 
     @staticmethod
-    def make(key, strength):
-        return FakeOnlineLoRAPatch(key, (strength, object(), 1.0, None, None))
+    def make(key, strength, form=tuple):
+        return FakeOnlineLoRAPatch(key, form((strength, object(), 1.0, None, None)))
 
 
 def krea2_keys():
@@ -158,6 +161,45 @@ class TestBlockMask(unittest.TestCase):
         strong = core.build_block_mask(self.COUNT, "CHARACTER", "Emphasize", 0.5, 1.5)
         self.assertLess(max(mild), max(strong))
         self.assertGreater(min(mild), min(strong))
+
+
+class TestListPayload(unittest.TestCase):
+    """Forge c2ae52e5+ payloads are mutable lists; upstream writes
+    patch[0][0] in place, and so do we."""
+
+    def test_list_payload_validates(self):
+        obj = FakeOnlineLoRAPatch.make("k", 1.0, form=list)
+        self.assertIsNone(core.validate_patch_object(obj))
+
+    def test_wrong_arity_list_rejected(self):
+        obj = FakeOnlineLoRAPatch("k", [1.0, object(), 1.0, None])
+        self.assertIn("arity", core.validate_patch_object(obj))
+
+    def test_rewrite_list_in_place(self):
+        obj = FakeOnlineLoRAPatch.make("k", 0.5, form=list)
+        payload_id = id(obj.patch[0])
+        sched = core.ScheduleSet()
+        sched.collect({}, {"k": [obj]}, lambda key: 1.0)
+        sched.apply_time_factor(0.25)
+        self.assertAlmostEqual(obj(0.0), 0.125, places=9)
+        self.assertIs(type(obj.patch[0]), list)
+        self.assertEqual(id(obj.patch[0]), payload_id)  # in place, not replaced
+
+    def test_rewrite_tuple_rebuilds(self):
+        obj = FakeOnlineLoRAPatch.make("k", 0.5, form=tuple)
+        sched = core.ScheduleSet()
+        sched.collect({}, {"k": [obj]}, lambda key: 1.0)
+        sched.apply_time_factor(0.25)
+        self.assertAlmostEqual(obj(0.0), 0.125, places=9)
+        self.assertIs(type(obj.patch[0]), tuple)
+
+    def test_base_survives_many_steps_list_form(self):
+        obj = FakeOnlineLoRAPatch.make("k", 0.7, form=list)
+        sched = core.ScheduleSet()
+        sched.collect({}, {"k": [obj]}, lambda key: 1.0)
+        for tf in (0.1, 0.9, 0.0, 1.0):
+            sched.apply_time_factor(tf)
+        self.assertAlmostEqual(obj.patch[0][0], 0.7, places=9)
 
 
 class TestKeyClassification(unittest.TestCase):

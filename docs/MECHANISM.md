@@ -1,6 +1,6 @@
 # Neo-LoraCtl — how it integrates with Forge Neo
 
-Technical companion to [PLAN.md](PLAN.md). Target build: `sd-webui-forge-classic`, neo branch, commit `92b55e1b` (2026-09). The project knowledge base (`knowledge_loractl.md`, kept outside this repo) carries the full investigation history.
+Technical companion to [PLAN.md](PLAN.md). Target builds: `sd-webui-forge-classic`, neo branch, `92b55e1b` through `c2ae52e5`+ (2026-09). Since `c2ae52e5` the `OnlineLoRAPatch` payload is a mutable list with an `obj.name` filename attribute instead of a tuple, and Forge itself ships a builtin per-step scheduler ("LoRA Control Integrated", prompt syntax `<lora:name:[a:b]>`) that writes `patch[0][0]` in place — both payload forms are supported here, and LoRAs using the builtin's syntax are automatically left to it (detected via the builtin's class-level mapping in the scripts registry). The project knowledge base (`knowledge_loractl.md`, kept outside this repo) carries the full investigation history.
 
 ## The strength model
 

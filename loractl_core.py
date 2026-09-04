@@ -6,11 +6,14 @@ into this module for everything that can be tested offline: preset masks,
 sigma curves, key classification, LoRA filtering, and per-step strength
 rewriting of OnlineLoRAPatch-style objects.
 
-Target build: sd-webui-forge-classic, neo branch, commit 92b55e1b.
-Patch tuples are 5 elements (strength, adapter, strength_model, offset,
-function); online patches are OnlineLoRAPatch objects held in
-ModelPatcher.weight_wrapper_patches[key], each carrying its tuple in a
-1-element list `obj.patch`. See docs/PLAN.md and knowledge_loractl.md.
+Target builds: sd-webui-forge-classic, neo branch, 92b55e1b through
+c2ae52e5+. Online patches are OnlineLoRAPatch objects held in
+ModelPatcher.weight_wrapper_patches[key], each carrying one 5-element
+payload (strength, adapter, strength_model, offset, function) in a
+1-element list `obj.patch`. The payload is a tuple up to 92b55e1b and a
+mutable list (plus an `obj.name` filename attribute) from c2ae52e5 on,
+where upstream itself schedules strengths per step; both forms are
+supported. See docs/PLAN.md and knowledge_loractl.md.
 """
 
 from __future__ import annotations
@@ -60,9 +63,9 @@ def validate_patch_object(obj) -> str | None:
     if not isinstance(patch, list) or len(patch) < 1:
         return f"patch object has no 1+-element .patch list: {type(obj).__name__}"
     entry = patch[0]
-    if not isinstance(entry, tuple) or len(entry) != PATCH_TUPLE_LEN:
-        got = len(entry) if isinstance(entry, tuple) else type(entry).__name__
-        return f"patch tuple arity mismatch: expected {PATCH_TUPLE_LEN}, got {got}"
+    if not isinstance(entry, (tuple, list)) or len(entry) != PATCH_TUPLE_LEN:
+        got = len(entry) if isinstance(entry, (tuple, list)) else type(entry).__name__
+        return f"patch payload arity mismatch: expected {PATCH_TUPLE_LEN}, got {got}"
     if not isinstance(entry[0], (int, float)):
         return f"patch tuple strength is not a number: {type(entry[0]).__name__}"
     if not callable(obj):
@@ -408,14 +411,20 @@ class ScheduleSet:
         return []
 
     def apply_time_factor(self, time_factor: float) -> None:
-        """Rewrite every owned patch tuple's strength to
-        base * block_factor * time_factor. Cheap no-op if unchanged."""
+        """Rewrite every owned patch payload's strength to
+        base * block_factor * time_factor. Cheap no-op if unchanged.
+        List payloads (Forge c2ae52e5+) are written in place; tuple
+        payloads (older builds) are rebuilt."""
         if self.last_factor is not None and time_factor == self.last_factor:
             return
         self.last_factor = time_factor
         for e in self.entries:
-            t = e.obj.patch[0]
-            e.obj.patch[0] = (e.base_strength * e.block_factor * time_factor,) + t[1:]
+            entry = e.obj.patch[0]
+            strength = e.base_strength * e.block_factor * time_factor
+            if isinstance(entry, list):
+                entry[0] = strength
+            else:
+                e.obj.patch[0] = (strength,) + entry[1:]
 
     def rebind_block_factors(self, block_factor_for_key) -> None:
         """Recompute block factors for existing entries (block preset changed
