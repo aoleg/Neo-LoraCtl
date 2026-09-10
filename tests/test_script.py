@@ -196,7 +196,8 @@ def _fake_networks(tuple_len=5):
         return new_model, clip
 
     networks.load_lora_for_models = load_lora_for_models
-    networks.load_lora_state_dict = lambda path: {"fake_sd": True}
+    networks.sv_state_dict = {"fake_sd": True}  # TE-less by default, like the real SDA
+    networks.load_lora_state_dict = lambda path: dict(networks.sv_state_dict)
     sv_entry = types.SimpleNamespace(name=SV_ALIAS, filename=SV_FILE)
     networks.available_network_aliases = {SV_ALIAS: sv_entry}
     networks.available_networks = {SV_ALIAS: sv_entry}
@@ -929,6 +930,7 @@ class TestSeedVariance(unittest.TestCase):
 
     def test_te_flag_reaches_loader(self):
         h = Harness()
+        h.networks.sv_state_dict = {"lora_te_text_model.lora_up.weight": 1}
         h.generate(["krea_turbo.safetensors"], strengths=[0.5],
                    ui=dict(self.UI, sv_te=True))
         sv_calls = [c for c in h.networks.calls if c["filename"] == SV_FILE]
@@ -980,6 +982,17 @@ class TestCondCacheInvalidation(unittest.TestCase):
         h.generate(["charA.safetensors"], p_attrs=dict(caches))
         for name in ("cached_c", "cached_uc"):
             self.assertIsNotNone(caches[name][0], name)
+
+    def test_te_less_lora_skips_loader_call(self):
+        """A state dict with no TE keys must not reach the loader with
+        model=None: that logs a spurious 'LoRA mismatch' warning."""
+        h = Harness()
+        h.generate(["krea_turbo.safetensors"], strengths=[0.5],
+                   ui={"sv_lora": SV_ALIAS, "sv_strength": 1.0, "sv_te": True})
+        sv_calls = [c for c in h.networks.calls if c["filename"] == SV_FILE]
+        self.assertEqual(len(sv_calls), 1)          # unet call only
+        self.assertTrue(sv_calls[0]["model"])
+        self.assertTrue(h.cls().sv_te_noop_logged)
 
     def test_sv_te_missing_component_logged_and_clip_untouched(self):
         h = Harness()

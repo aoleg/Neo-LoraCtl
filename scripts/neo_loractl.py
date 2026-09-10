@@ -642,6 +642,10 @@ class NeoLoraCtlScript(scripts.Script):
         cls.sv_sd = (cls.sv_path, sd)
         return sd
 
+    # Common text-encoder key prefixes across LoRA formats (kohya lora_te*/
+    # lora_te1*/lora_te2*, diffusers text_encoder.*, ComfyUI text_encoders.*).
+    _TE_KEY_PREFIXES = ("lora_te", "text_encoder", "clip_l.", "clip_g.", "t5xxl.")
+
     @classmethod
     def sv_apply_te(cls, p):
         """TE half, applied in process_batch: the conditioning is encoded
@@ -651,6 +655,16 @@ class NeoLoraCtlScript(scripts.Script):
             return
         sd = cls._sv_state_dict()
         if sd is None:
+            return
+        if not any(k.startswith(cls._TE_KEY_PREFIXES) for k in sd):
+            # No text-encoder keys at all (true for krea2-turbo-sda). Skip
+            # the loader call entirely: with model=None and zero clip
+            # matches it would log a spurious "LoRA mismatch for default"
+            # warning before returning unchanged.
+            if not cls.sv_te_noop_logged:
+                cls.sv_te_noop_logged = True
+                _log(f"'{os.path.basename(cls.sv_path)}' has no text-encoder "
+                     "component; the TE checkbox has no effect for this LoRA")
             return
         clip = p.sd_model.forge_objects.clip
         result = _original_load_lora_for_models(
