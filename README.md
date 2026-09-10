@@ -20,9 +20,7 @@ Copy or clone this folder into `extensions/` inside your Forge Neo install and r
 
 Add LoRAs to your prompt as usual, for example `<lora:my_character:1>`. Open the Neo-LoraCtl accordion and tick Enable. The three sections below it (Blocks, Timesteps, Seed Variance) each have a checkbox in their header that both switches the section on and unfolds it, so an unchecked section is guaranteed inactive no matter what its controls say.
 
-If you want one recipe to start with: for a character LoRA that bleeds style into your images, just check the Blocks section. Its defaults are that recipe: `CHARACTER`, `Emphasize`, contrast 0.5. This is the combination in the middle panel above, and here is what it looks like in the UI:
-
-![Neo-LoraCtl panel](img/screenshot.png)
+If you want one recipe to start with: for a character LoRA that bleeds style into your images, just check the Blocks section. Its defaults are that recipe: `CHARACTER`, `Emphasize`, contrast 0.5. This is the combination in the middle panel above.
 
 ## Blocks: where in the model the LoRA acts
 
@@ -32,6 +30,8 @@ If you want one recipe to start with: for a character LoRA that bleeds style int
 | `COMPOSITION` | Early blocks: layout, poses, large scale geometry. |
 | `CHARACTER` | Middle blocks: subject identity, faces. |
 | `STYLE` | Late blocks: textures, grain, coloring, rendering style. |
+
+![Blocks section](img/blocks.png)
 
 These zone names are backed by testing, on Krea 2 with character LoRAs. Emphasizing CHARACTER visibly strengthens identity. Emphasizing STYLE makes the LoRA's texture fingerprint plainly visible, which is exactly what you would suppress it for:
 
@@ -47,6 +47,8 @@ Look at the skin. Left: the LoRA at full strength carries some of its training g
 | `COMPOSITION` | Early steps, where the image layout and the subject's identity form. |
 | `MIDRANGE` | The middle stretch of the run. |
 | `DETAIL` | Late steps, where fine detail and surface rendering form. |
+
+![Timesteps section](img/timesteps.png)
 
 One thing our testing made very clear: on short schedules such as Krea 2 Turbo, faces form in the early steps. If you want to protect a character, the timestep preset that helps is `COMPOSITION`, and by the MIDRANGE steps the identity is already settled. MIDRANGE is named by position rather than function on purpose, because we have not yet pinned down what it distinctly controls, and a name should promise only what it can keep.
 
@@ -78,6 +80,8 @@ Start with one axis at a time. The axes multiply, and two aggressive settings at
 
 Distilled checkpoints such as Krea 2 Turbo pay for their speed with monotony: different seeds often produce near identical compositions. Helper LoRAs exist to fix exactly that, and the one this section was built for is **[krea2-turbo-sda](https://huggingface.co/F16/krea2-turbo-sda)**, a seed diversity adapter for Krea 2 Turbo. It restores the variety across seeds that distillation took away, and it must only run during the first steps of the generation, while the composition forms. Applied for the whole run it degrades the image.
 
+![Seed Variance section](img/seed_variance.png)
+
 Check the Seed Variance section; if you have a seed variance adapter installed it is preselected automatically (adapters are recognized by name and listed first in the dropdown). Set its strength and generate. Neo-LoraCtl applies it at full speed during the composition steps and switches it off the moment the run leaves the composition zone, at the same sigma boundary the timestep presets use. Because the switch point is a noise level rather than a step number, it lands right no matter how many steps you run.
 
 Do not add this LoRA to your prompt as well: the dropdown is the whole interface for it, and if it also appears in the prompt the section steps aside and tells you so in the console.
@@ -87,6 +91,10 @@ The "Apply its text encoder" checkbox controls whether the adapter's text encode
 ## Compile
 
 The Compile checkbox (on by default) bakes every schedule that does not change during the run straight into the model weights. A block preset with flat timesteps then generates at full native speed, exactly as fast as a plain LoRA, instead of paying the on-the-fly patching cost every step. Only an active timestep preset still needs on-the-fly patching, and Neo-LoraCtl falls back to it automatically for those runs.
+
+![Advanced section](img/advanced.png)
+
+Compile sits in the Advanced fold together with the LoRA filter, the text encoder toggle and debug logging.
 
 Two things change with Compile on. Adjusting block settings triggers a short LoRA reload (a second or two, once per change) instead of applying instantly. And on quantized checkpoints the baked result is not pixel identical to the on-the-fly result; it matches plain LoRA behavior, which is the more faithful reference.
 
