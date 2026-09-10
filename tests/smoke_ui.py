@@ -40,5 +40,5 @@ spec.loader.exec_module(mod)
 with gr.Blocks():
     components = mod.NeoLoraCtlScript().ui(False)
 
-assert len(components) == 15, f"expected 15 components, got {len(components)}"
+assert len(components) == 19, f"expected 19 components, got {len(components)}"
 print(f"OK: gradio {gr.__version__}, {len(components)} components built")

@@ -108,6 +108,8 @@ class FakeDM:
 class FakeInnerModel:
     def __init__(self, n_blocks=28):
         self.diffusion_model = FakeDM(n_blocks)
+        self.weights = {}          # key -> float ("merged weight" observable)
+        self.current_uuid = None
 
 
 class FakePatcher:
@@ -117,15 +119,23 @@ class FakePatcher:
         self.patches = {}
         self.weight_wrapper_patches = {}
         self.model = FakeInnerModel(n_blocks)
+        self.backup = {}           # key -> original "weight" (float), shared like Forge
+        self.patches_uuid = 0
 
     def clone(self):
         n = FakePatcher()
         n.patches = {k: v[:] for k, v in self.patches.items()}
         n.weight_wrapper_patches = self.weight_wrapper_patches.copy()  # shares lists, like Forge
         n.model = self.model
+        n.backup = self.backup
+        n.patches_uuid = self.patches_uuid
         return n
 
+    _uuid_counter = 0
+
     def add_patches(self, keys, strength, online_mode, tuple_len=5, filename=""):
+        FakePatcher._uuid_counter += 1
+        self.patches_uuid = FakePatcher._uuid_counter  # uuid4 in Forge: always fresh
         for key in keys:
             if tuple_len == 5:
                 t = FakePatcher.payload_form((strength, object(), 1.0, None, None))
@@ -140,6 +150,18 @@ class FakePatcher:
                 self.patches[key] = cur
 
 
+def _fake_rebake_keys(patcher, keys):
+    """Offline stand-in for the backend surgery: recompute a key's fake
+    weight from its backup plus all nonzero payload strengths."""
+    n = 0
+    for key in keys:
+        if key in patcher.backup:
+            patcher.model.weights[key] = patcher.backup[key] + sum(
+                float(e[0]) for e in patcher.patches.get(key, []) if e[0] != 0.0)
+            n += 1
+    return n
+
+
 LORA_KEYS = {
     "charA.safetensors": ["diffusion_model.blocks.0.attn.qkv.weight",
                           "diffusion_model.blocks.20.mlp.0.weight",
@@ -147,7 +169,14 @@ LORA_KEYS = {
     "styleB.safetensors": ["diffusion_model.blocks.5.attn.qkv.weight",
                            "diffusion_model.blocks.27.mlp.0.weight"],
     "krea_turbo.safetensors": ["diffusion_model.blocks.1.attn.qkv.weight"],
+    "krea2_turbo_sda_v1.0.safetensors": [
+        "diffusion_model.blocks.1.attn.qkv.weight",   # shared with krea_turbo
+        "diffusion_model.blocks.9.mlp.0.weight",      # exclusive
+    ],
 }
+
+SV_FILE = "krea2_turbo_sda_v1.0.safetensors"
+SV_ALIAS = "krea2_turbo_sda_v1.0"
 
 
 def _fake_networks(tuple_len=5):
@@ -164,12 +193,17 @@ def _fake_networks(tuple_len=5):
         return new_model, clip
 
     networks.load_lora_for_models = load_lora_for_models
+    networks.load_lora_state_dict = lambda path: {"fake_sd": True}
+    sv_entry = types.SimpleNamespace(name=SV_ALIAS, filename=SV_FILE)
+    networks.available_network_aliases = {SV_ALIAS: sv_entry}
+    networks.available_networks = {SV_ALIAS: sv_entry}
     return networks
 
 
 class FakeForgeObjects:
     def __init__(self, unet):
         self.unet = unet
+        self.clip = object()
 
 
 class FakeSDModel:
@@ -226,7 +260,8 @@ def _load_script(networks_mod):
 UI_DEFAULTS = dict(enabled=True, block_preset="FULL", block_modifier="Emphasize",
                    block_contrast=1.0, block_boost=1.0, time_preset="FLAT",
                    time_modifier="Emphasize", time_contrast=1.0, time_boost=1.0,
-                   te_enabled=True, filter_mode="exclude",
+                   sv_lora="None", sv_strength=1.0, sv_te=False,
+                   te_enabled=True, filter_mode="exclude", compile_bake=False,
                    filter_patterns=core.DEFAULT_EXCLUDE_PATTERNS, debug=False,
                    dev_mask="", dev_bounds="")
 
@@ -237,6 +272,7 @@ class Harness:
     def __init__(self, tuple_len=5):
         self.networks = _fake_networks(tuple_len=tuple_len)
         self.mod = _load_script(self.networks)
+        self.mod._rebake_keys = _fake_rebake_keys  # no real backend offline
         self.script = self.mod.NeoLoraCtlScript()
         self.sd_model = FakeSDModel()
         sys.modules["modules.shared"].sd_model = self.sd_model
@@ -256,7 +292,7 @@ class Harness:
                 self.sd_model.forge_objects.unet = result[0]
 
     def generate(self, lora_files, strengths=None, ui=None, steps_schedule=KREA_SCHEDULE,
-                 p_attrs=None):
+                 p_attrs=None, batches=1, stop_after=None):
         ui_args = dict(UI_DEFAULTS)
         ui_args.update(ui or {})
         p = FakeP(self.sd_model, schedule=steps_schedule)
@@ -264,19 +300,43 @@ class Harness:
             setattr(p, k, v)
         s = self.script
         s.process(p, **ui_args)
-        s.before_process_batch(p)
-        self.activate(p, lora_files, strengths)
-        s.process_batch(p)
-        s.process_before_every_sampling(p)
-        sigmas = p.sampler.get_sigmas(p, len(steps_schedule) - 1)
         Params = sys.modules["modules.script_callbacks"].CFGDenoiserParams
         strengths_per_step = []
-        for sigma in sigmas[:-1]:
-            for cb in _cfg_callbacks:
-                cb(Params(sigma))
-            strengths_per_step.append(self.snapshot_strengths())
+        self.weight_steps = []
+        for _ in range(batches):
+            s.before_process_batch(p)
+            self.activate(p, lora_files, strengths)
+            s.process_batch(p)
+            s.process_before_every_sampling(p)
+            self.fake_load()
+            sigmas = p.sampler.get_sigmas(p, len(steps_schedule) - 1)
+            steps = sigmas[:-1] if stop_after is None else sigmas[:-1][:stop_after]
+            for sigma in steps:
+                for cb in _cfg_callbacks:
+                    cb(Params(sigma))
+                strengths_per_step.append(self.snapshot_strengths())
+                self.weight_steps.append(self.weights())
         s.postprocess(p, object())
         return p, strengths_per_step
+
+    def fake_load(self):
+        """Simulate sampling_prepare/load_models_gpu on the pinned build:
+        uuid mismatch -> restore every backed-up key, then re-bake all baked
+        patches with fresh backups (partially_load semantics)."""
+        unet = self.sd_model.forge_objects.unet
+        model = unet.model
+        if model.current_uuid == unet.patches_uuid:
+            return
+        for key, orig in list(unet.backup.items()):
+            model.weights[key] = orig
+        unet.backup.clear()
+        for key, plist in unet.patches.items():
+            unet.backup[key] = model.weights.get(key, 0.0)
+            model.weights[key] = unet.backup[key] + sum(float(e[0]) for e in plist)
+        model.current_uuid = unet.patches_uuid
+
+    def weights(self):
+        return dict(self.sd_model.forge_objects.unet.model.weights)
 
     def snapshot_strengths(self):
         out = {}
@@ -727,6 +787,156 @@ class TestSigmaCapture(unittest.TestCase):
         h.script.process_before_every_sampling(p)  # second call must not re-wrap
         self.assertIs(p.sampler.get_sigmas, wrapped)
         self.assertEqual(wrapped(p, 8), KREA_SCHEDULE)
+
+
+SDA_SHARED = "diffusion_model.blocks.1.attn.qkv.weight"
+SDA_EXCL = "diffusion_model.blocks.9.mlp.0.weight"
+
+
+class TestCompileMode(unittest.TestCase):
+    """Compile ON + flat time: block masks are baked into tuple strengths;
+    generation needs no runtime scheduling at all."""
+
+    def test_flat_blocks_are_baked_and_scaled(self):
+        h = Harness()
+        h.generate(["charA.safetensors"], strengths=[0.5],
+                   ui={"compile_bake": True, "block_preset": "STYLE",
+                       "block_modifier": "Isolate", "block_contrast": 1.0})
+        call = h.networks.calls[0]
+        self.assertEqual(call["online_mode"], False)
+        self.assertEqual(len(h.cls().sched.entries), 0)
+        self.assertEqual(h.cls().baked_files, ["charA.safetensors"])
+        unet = h.sd_model.forge_objects.unet
+        self.assertEqual(unet.weight_wrapper_patches, {})
+        w = h.weights()
+        self.assertAlmostEqual(w["diffusion_model.blocks.0.attn.qkv.weight"],
+                               0.5 * STYLE_MASK[0], places=9)
+        self.assertAlmostEqual(w["diffusion_model.blocks.20.mlp.0.weight"],
+                               0.5 * STYLE_MASK[20], places=9)
+        self.assertAlmostEqual(w["diffusion_model.txtfusion.projector.weight"],
+                               0.5, places=9)  # non-block key: factor 1.0
+
+    def test_weights_stable_across_steps(self):
+        h = Harness()
+        h.generate(["charA.safetensors"], strengths=[0.5],
+                   ui={"compile_bake": True, "block_preset": "CHARACTER",
+                       "block_contrast": 0.5})
+        first, last = h.weight_steps[0], h.weight_steps[-1]
+        self.assertEqual(first, last)
+
+    def test_active_time_curve_falls_back_to_online(self):
+        h = Harness()
+        h.generate(["charA.safetensors"], strengths=[0.5],
+                   ui={"compile_bake": True, "time_preset": "COMPOSITION",
+                       "time_contrast": 0.5})
+        self.assertEqual(h.networks.calls[0]["online_mode"], True)
+        self.assertEqual(len(h.cls().sched.entries), 3)
+        self.assertEqual(h.cls().baked_files, [])
+
+    def test_block_config_change_forces_reload(self):
+        h = Harness()
+        h.generate(["charA.safetensors"], strengths=[0.5],
+                   ui={"compile_bake": True, "block_preset": "STYLE",
+                       "block_modifier": "Isolate", "block_contrast": 1.0})
+        self.assertEqual(len(h.networks.calls), 1)
+        h.generate(["charA.safetensors"], strengths=[0.5],
+                   ui={"compile_bake": True, "block_preset": "COMPOSITION",
+                       "block_modifier": "Isolate", "block_contrast": 1.0})
+        self.assertEqual(len(h.networks.calls), 2)  # reloaded and rescaled
+        comp_mask = core.build_block_mask(28, "COMPOSITION", "Isolate", 1.0)
+        w = h.weights()
+        self.assertAlmostEqual(w["diffusion_model.blocks.0.attn.qkv.weight"],
+                               0.5 * comp_mask[0], places=9)
+        self.assertAlmostEqual(w["diffusion_model.blocks.20.mlp.0.weight"],
+                               0.5 * comp_mask[20], places=9)
+
+
+class TestSeedVariance(unittest.TestCase):
+    """SV LoRA baked at X, restored below the composition boundary, cleaned
+    at end of job. Prompt carries the (excluded) turbo LoRA at 0.5, which
+    shares SDA_SHARED with the SV LoRA."""
+
+    UI = {"sv_lora": SV_ALIAS, "sv_strength": 1.0}
+
+    def test_phase_switch_at_composition_boundary(self):
+        h = Harness()
+        h.generate(["krea_turbo.safetensors"], strengths=[0.5], ui=self.UI)
+        # KREA_SCHEDULE: 1.0, 0.9567, 0.9045 are >= 0.90; 0.8403 is first below.
+        for i in (0, 1, 2):
+            self.assertAlmostEqual(h.weight_steps[i][SDA_EXCL], 1.0, places=9)
+            self.assertAlmostEqual(h.weight_steps[i][SDA_SHARED], 1.5, places=9)
+        for i in range(3, len(h.weight_steps)):
+            self.assertAlmostEqual(h.weight_steps[i][SDA_EXCL], 0.0, places=9)
+            self.assertAlmostEqual(h.weight_steps[i][SDA_SHARED], 0.5, places=9)
+
+    def test_cleanup_after_job(self):
+        h = Harness()
+        h.generate(["krea_turbo.safetensors"], strengths=[0.5], ui=self.UI)
+        cls = h.cls()
+        self.assertIsNone(cls.sv_handle)
+        unet = h.sd_model.forge_objects.unet
+        self.assertNotIn(SDA_EXCL, unet.patches)          # payloads removed
+        self.assertNotIn(SDA_EXCL, unet.backup)           # exclusive backup freed
+        self.assertIn(SDA_SHARED, unet.backup)            # turbo backup stays
+        w = h.weights()
+        self.assertAlmostEqual(w[SDA_EXCL], 0.0, places=9)
+        self.assertAlmostEqual(w[SDA_SHARED], 0.5, places=9)
+
+    def test_interrupt_before_boundary_restores_in_postprocess(self):
+        h = Harness()
+        h.generate(["krea_turbo.safetensors"], strengths=[0.5], ui=self.UI,
+                   stop_after=2)  # interrupted during the X phase
+        self.assertAlmostEqual(h.weight_steps[-1][SDA_EXCL], 1.0, places=9)
+        w = h.weights()
+        self.assertAlmostEqual(w[SDA_EXCL], 0.0, places=9)
+        self.assertAlmostEqual(w[SDA_SHARED], 0.5, places=9)
+        self.assertIsNone(h.cls().sv_handle)
+
+    def test_second_batch_rebakes(self):
+        h = Harness()
+        h.generate(["krea_turbo.safetensors"], strengths=[0.5], ui=self.UI,
+                   batches=2)
+        n = len(KREA_SCHEDULE) - 1
+        self.assertAlmostEqual(h.weight_steps[n][SDA_EXCL], 1.0, places=9)   # batch 2, step 0
+        self.assertAlmostEqual(h.weight_steps[-1][SDA_EXCL], 0.0, places=9)  # batch 2, tail
+        w = h.weights()
+        self.assertAlmostEqual(w[SDA_EXCL], 0.0, places=9)
+
+    def test_prompt_collision_skips_section(self):
+        h = Harness()
+        h.generate([SV_FILE, "krea_turbo.safetensors"], strengths=[0.7, 0.5],
+                   ui=self.UI)
+        self.assertIsNone(h.cls().sv_handle)
+        # The prompt instance applies untouched, full run.
+        self.assertAlmostEqual(h.weight_steps[-1][SDA_EXCL], 0.7, places=9)
+
+    def test_te_flag_reaches_loader(self):
+        h = Harness()
+        h.generate(["krea_turbo.safetensors"], strengths=[0.5],
+                   ui=dict(self.UI, sv_te=True))
+        sv_calls = [c for c in h.networks.calls if c["filename"] == SV_FILE]
+        self.assertEqual(len(sv_calls), 1)
+        self.assertEqual(sv_calls[0]["strength_clip"], 1.0)
+        h2 = Harness()
+        h2.generate(["krea_turbo.safetensors"], strengths=[0.5], ui=self.UI)
+        sv_calls = [c for c in h2.networks.calls if c["filename"] == SV_FILE]
+        self.assertEqual(sv_calls[0]["strength_clip"], 0.0)
+
+    def test_infotext(self):
+        h = Harness()
+        p, _ = h.generate(["krea_turbo.safetensors"], strengths=[0.5], ui=self.UI)
+        self.assertEqual(p.extra_generation_params["LoraCtl SV"],
+                         "krea2_turbo_sda_v1.0/1/TE off")
+        self.assertEqual(p.extra_generation_params["LoraCtl mode"], "online")
+
+
+class TestSvSorting(unittest.TestCase):
+    def test_priority_names_first(self):
+        names = ["zeta_style", "krea2_turbo_sda_v1.0", "alpha_char", "my-sda-v2",
+                 "sdapp_tool"]
+        ordered = core.sort_sv_choices(names)
+        self.assertEqual(ordered[:2], ["krea2_turbo_sda_v1.0", "my-sda-v2"])
+        self.assertNotIn("sdapp_tool", ordered[:2])  # sda not delimited
 
 
 if __name__ == "__main__":

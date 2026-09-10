@@ -74,6 +74,22 @@ Protecting identity on the time axis: Timesteps `COMPOSITION` + `Emphasize` at m
 
 Start with one axis at a time. The axes multiply, and two aggressive settings at once attenuate much harder than either alone.
 
+## Seed Variance
+
+Distilled checkpoints such as Krea 2 Turbo pay for their speed with monotony: different seeds often produce near identical compositions. Helper LoRAs exist to fix exactly that, and the one this section was built for is **[krea2-turbo-sda](https://huggingface.co/F16/krea2-turbo-sda)**, a seed diversity adapter for Krea 2 Turbo. It restores the variety across seeds that distillation took away, and it must only run during the first steps of the generation, while the composition forms. Applied for the whole run it degrades the image.
+
+Pick it in the Seed variance LoRA dropdown (LoRAs whose names look like seed variance adapters are listed first), set its strength, and generate. Neo-LoraCtl applies it at full speed during the composition steps and switches it off the moment the run leaves the composition zone, at the same sigma boundary the timestep presets use. Because the switch point is a noise level rather than a step number, it lands right no matter how many steps you run.
+
+Do not add this LoRA to your prompt as well: the dropdown is the whole interface for it, and if it also appears in the prompt the section steps aside and tells you so in the console.
+
+The "Apply its text encoder" checkbox controls whether the adapter's text encoder half is used. It is off by default; the text encoder applies to the whole run by nature, which works against a composition-only adapter, but the checkbox is there so you can compare both ways.
+
+## Compile
+
+The Compile checkbox (on by default) bakes every schedule that does not change during the run straight into the model weights. A block preset with flat timesteps then generates at full native speed, exactly as fast as a plain LoRA, instead of paying the on-the-fly patching cost every step. Only an active timestep preset still needs on-the-fly patching, and Neo-LoraCtl falls back to it automatically for those runs.
+
+Two things change with Compile on. Adjusting block settings triggers a short LoRA reload (a second or two, once per change) instead of applying instantly. And on quantized checkpoints the baked result is not pixel identical to the on-the-fly result; it matches plain LoRA behavior, which is the more faithful reference.
+
 ## The filter
 
 Some LoRAs must never be scheduled. Above all this means accelerator LoRAs such as Turbo, Lightning, Hyper, LCM and DMD, which are part of the checkpoint's distillation and break when their strength changes mid run. The filter excludes them by default through name matching. You can edit the pattern list, or switch to include mode to schedule only the LoRAs you name.
@@ -88,7 +104,7 @@ Ten XYZ grid axes are registered under `(LoraCtl)`: both presets, modifiers, con
 
 All settings are written into the generation's infotext, so any image you keep documents exactly how it was made.
 
-Scheduled LoRAs are applied on the fly instead of being merged into the weights. This costs some generation speed on the affected layers, the same trade off as Forge's own "Patch LoRAs on-the-fly" option, applied only to the LoRAs you schedule.
+With Compile off, or whenever a timestep preset is active, scheduled LoRAs are applied on the fly instead of being merged into the weights. This costs some generation speed on the affected layers, the same trade off as Forge's own "Patch LoRAs on-the-fly" option, applied only to the LoRAs you schedule.
 
 Enable Debug logging to see the captured sigma schedule, the zone boundaries, which LoRAs were scheduled and a per run summary. Include that output in any bug report.
 

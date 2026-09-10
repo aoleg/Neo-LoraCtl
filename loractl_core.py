@@ -368,6 +368,158 @@ def parse_mask_override(text: str, count: int) -> list[float] | None:
     return values
 
 
+def _payload_error(entry) -> str | None:
+    if not isinstance(entry, (tuple, list)) or len(entry) != PATCH_TUPLE_LEN:
+        got = len(entry) if isinstance(entry, (tuple, list)) else type(entry).__name__
+        return f"payload arity mismatch: expected {PATCH_TUPLE_LEN}, got {got}"
+    if not isinstance(entry[0], (int, float)):
+        return f"payload strength is not a number: {type(entry[0]).__name__}"
+    return None
+
+
+def _set_payload_strength(container: list, index: int, strength: float) -> None:
+    entry = container[index]
+    if isinstance(entry, list):
+        entry[0] = strength
+    else:
+        container[index] = (strength,) + tuple(entry[1:])
+
+
+# ---------------------------------------------------------------------------
+# Compile mode: scale freshly added BAKED patches by their block factor, once,
+# before any weight is touched. The ordinary baked path then merges them and
+# the generation runs at full native speed.
+# ---------------------------------------------------------------------------
+
+def scale_new_baked_patches(before_counts: dict[str, int], patches: dict,
+                            factor_for_key) -> tuple[int, list[str]]:
+    """Multiply the strength of every payload added since `before_counts` by
+    factor_for_key(key). Validate-all-then-apply: on any drift error nothing
+    is scaled. Returns (scaled_count, errors)."""
+    targets = []
+    errors = []
+    for key, plist in patches.items():
+        for i in range(before_counts.get(key, 0), len(plist)):
+            err = _payload_error(plist[i])
+            if err is not None:
+                errors.append(f"{key}: {err}")
+            else:
+                targets.append((key, plist, i))
+    if errors:
+        return 0, errors
+    for key, plist, i in targets:
+        factor = float(factor_for_key(key))
+        if factor != 1.0:
+            _set_payload_strength(plist, i, float(plist[i][0]) * factor)
+    return len(targets), []
+
+
+# ---------------------------------------------------------------------------
+# Seed Variance: a self-loaded LoRA baked at strength X, switched off (de-
+# baked) when the run leaves the composition zone. This handle is the pure
+# bookkeeping half; the weight surgery lives in the Forge script.
+# ---------------------------------------------------------------------------
+
+def sv_is_priority(name: str) -> bool:
+    """Seed-variance LoRA name heuristic: both 'turbo' and 'sda', or a
+    delimited 'sda' token."""
+    low = name.lower()
+    if "turbo" in low and "sda" in low:
+        return True
+    return re.search(r"(^|[-_ .])sda([-_ .]|$)", low) is not None
+
+
+def sort_sv_choices(names) -> list[str]:
+    pri = sorted((n for n in names if sv_is_priority(n)), key=str.lower)
+    rest = sorted((n for n in names if not sv_is_priority(n)), key=str.lower)
+    return pri + rest
+
+
+@dataclass
+class BakedLoraHandle:
+    """Tracks one baked LoRA's payloads inside a patcher's `patches` dict by
+    (key, adapter identity), so strengths can be swapped between X and 0 and
+    the payloads removed cleanly at end of job."""
+    entries: list = field(default_factory=list)  # (key, adapter object)
+    base_strength: float = 1.0
+    current_strength: float = 1.0
+
+    @classmethod
+    def collect(cls, before_counts: dict[str, int], patches: dict,
+                base_strength: float):
+        """Adopt payloads added since `before_counts`. Returns (handle, errors);
+        on any error the handle is None and nothing is adopted."""
+        entries = []
+        errors = []
+        for key, plist in patches.items():
+            for i in range(before_counts.get(key, 0), len(plist)):
+                err = _payload_error(plist[i])
+                if err is not None:
+                    errors.append(f"{key}: {err}")
+                else:
+                    entries.append((key, plist[i][1]))
+        if errors:
+            return None, errors
+        return cls(entries=entries, base_strength=float(base_strength),
+                   current_strength=float(base_strength)), []
+
+    def _locate(self, patches: dict, key: str, adapter) -> tuple[list, int] | None:
+        plist = patches.get(key)
+        if not plist:
+            return None
+        for i, entry in enumerate(plist):
+            if isinstance(entry, (tuple, list)) and len(entry) == PATCH_TUPLE_LEN \
+                    and entry[1] is adapter:
+                return plist, i
+        return None
+
+    def keys(self) -> list[str]:
+        seen = []
+        for key, _ in self.entries:
+            if key not in seen:
+                seen.append(key)
+        return seen
+
+    def present_in(self, patches: dict) -> bool:
+        return bool(self.entries) and all(
+            self._locate(patches, key, adapter) is not None
+            for key, adapter in self.entries)
+
+    def set_strength(self, patches: dict, strength: float) -> list[str]:
+        """Write `strength` into every owned payload. Returns the affected
+        keys (for the caller to re-bake their weights)."""
+        affected = []
+        for key, adapter in self.entries:
+            loc = self._locate(patches, key, adapter)
+            if loc is None:
+                continue
+            plist, i = loc
+            _set_payload_strength(plist, i, strength)
+            if key not in affected:
+                affected.append(key)
+        self.current_strength = float(strength)
+        return affected
+
+    def remove_from(self, patches: dict) -> tuple[list[str], list[str]]:
+        """Delete owned payloads from the dict. Returns (our_keys,
+        emptied_keys) where emptied keys had no other patches and were popped
+        — their backups are exclusively ours and safe to drop once weights
+        are restored."""
+        our_keys = self.keys()
+        emptied = []
+        for key, adapter in self.entries:
+            loc = self._locate(patches, key, adapter)
+            if loc is None:
+                continue
+            plist, i = loc
+            del plist[i]
+            if not plist and key in patches:
+                del patches[key]
+                emptied.append(key)
+        self.entries = []
+        return our_keys, emptied
+
+
 @dataclass
 class ScheduledEntry:
     obj: object          # OnlineLoRAPatch-like: .patch = [5-tuple]
