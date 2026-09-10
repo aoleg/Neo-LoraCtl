@@ -18,9 +18,9 @@ Copy or clone this folder into `extensions/` inside your Forge Neo install and r
 
 ## Quick start
 
-Add LoRAs to your prompt as usual, for example `<lora:my_character:1>`. Open the Neo-LoraCtl accordion, tick Enable, and pick a preset on either axis or both.
+Add LoRAs to your prompt as usual, for example `<lora:my_character:1>`. Open the Neo-LoraCtl accordion and tick Enable. The three sections below it (Blocks, Timesteps, Seed Variance) each have a checkbox in their header that both switches the section on and unfolds it, so an unchecked section is guaranteed inactive no matter what its controls say.
 
-If you want one recipe to start with: for a character LoRA that bleeds style into your images, set Blocks to `CHARACTER`, Modifier to `Emphasize`, Contrast to 0.5, and leave the Timesteps at `FLAT`. This is the combination in the middle panel above, and here is what it looks like in the UI:
+If you want one recipe to start with: for a character LoRA that bleeds style into your images, just check the Blocks section. Its defaults are that recipe: `CHARACTER`, `Emphasize`, contrast 0.5. This is the combination in the middle panel above, and here is what it looks like in the UI:
 
 ![Neo-LoraCtl panel](img/screenshot.png)
 
@@ -78,7 +78,7 @@ Start with one axis at a time. The axes multiply, and two aggressive settings at
 
 Distilled checkpoints such as Krea 2 Turbo pay for their speed with monotony: different seeds often produce near identical compositions. Helper LoRAs exist to fix exactly that, and the one this section was built for is **[krea2-turbo-sda](https://huggingface.co/F16/krea2-turbo-sda)**, a seed diversity adapter for Krea 2 Turbo. It restores the variety across seeds that distillation took away, and it must only run during the first steps of the generation, while the composition forms. Applied for the whole run it degrades the image.
 
-Pick it in the Seed variance LoRA dropdown (LoRAs whose names look like seed variance adapters are listed first), set its strength, and generate. Neo-LoraCtl applies it at full speed during the composition steps and switches it off the moment the run leaves the composition zone, at the same sigma boundary the timestep presets use. Because the switch point is a noise level rather than a step number, it lands right no matter how many steps you run.
+Check the Seed Variance section; if you have a seed variance adapter installed it is preselected automatically (adapters are recognized by name and listed first in the dropdown). Set its strength and generate. Neo-LoraCtl applies it at full speed during the composition steps and switches it off the moment the run leaves the composition zone, at the same sigma boundary the timestep presets use. Because the switch point is a noise level rather than a step number, it lands right no matter how many steps you run.
 
 Do not add this LoRA to your prompt as well: the dropdown is the whole interface for it, and if it also appears in the prompt the section steps aside and tells you so in the console.
 

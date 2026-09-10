@@ -29,6 +29,12 @@ class _FakeComponent:
     def __init__(self, *a, **kw):
         self.kwargs = kw
 
+    def change(self, *a, **kw):
+        return None
+
+    def input(self, *a, **kw):
+        return None
+
     def __enter__(self):
         return self
 
@@ -266,7 +272,8 @@ def _load_script(networks_mod):
     return mod
 
 
-UI_DEFAULTS = dict(enabled=True, block_preset="FULL", block_modifier="Emphasize",
+UI_DEFAULTS = dict(enabled=True, blocks_enabled=True, time_enabled=True,
+                   sv_enabled=True, block_preset="FULL", block_modifier="Emphasize",
                    block_contrast=1.0, block_boost=1.0, time_preset="FLAT",
                    time_modifier="Emphasize", time_contrast=1.0, time_boost=1.0,
                    sv_lora="None", sv_strength=1.0, sv_te=False,
@@ -1002,6 +1009,37 @@ class TestCondCacheInvalidation(unittest.TestCase):
         self.assertTrue(h.cls().sv_te_noop_logged)
         # Fake loader returns the same clip object (no TE keys): not adopted.
         self.assertIs(h.sd_model.forge_objects.clip, clip_before)
+
+
+class TestSectionGating(unittest.TestCase):
+    def test_blocks_section_unchecked_means_full(self):
+        h = Harness()
+        _, per_step = h.generate(["charA.safetensors"], strengths=[0.5],
+                                 ui={"blocks_enabled": False, "block_preset": "STYLE",
+                                     "block_modifier": "Isolate", "block_contrast": 1.0})
+        for step in per_step:
+            for v in step.values():
+                self.assertAlmostEqual(v, 0.5, places=9)
+
+    def test_time_section_unchecked_means_flat(self):
+        h = Harness()
+        _, per_step = h.generate(["charA.safetensors"], strengths=[0.5],
+                                 ui={"time_enabled": False, "time_preset": "COMPOSITION",
+                                     "time_modifier": "Isolate", "time_contrast": 1.0})
+        for step in per_step:
+            for v in step.values():
+                self.assertAlmostEqual(v, 0.5, places=9)
+
+    def test_sv_section_unchecked_means_off(self):
+        h = Harness()
+        h.generate(["krea_turbo.safetensors"], strengths=[0.5],
+                   ui={"sv_enabled": False, "sv_lora": SV_ALIAS})
+        self.assertIsNone(h.cls().sv_handle)
+        self.assertNotIn(SDA_EXCL, h.weights())
+
+    def test_sv_default_choice_prefers_priority_lora(self):
+        h = Harness()
+        self.assertEqual(h.mod._sv_default_choice(), SV_ALIAS)
 
 
 class TestSvSorting(unittest.TestCase):

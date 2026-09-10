@@ -147,6 +147,29 @@ def _sv_resolve_path(name):
     return None
 
 
+def _input_accordion(value, label):
+    """Forge's InputAccordion: an accordion whose header checkbox is the
+    input value (checked = enabled, and it folds/unfolds the section).
+    Returns (context_manager, input_component). Falls back to a plain
+    checkbox above an accordion where InputAccordion is unavailable."""
+    try:
+        from modules.ui_components import InputAccordion
+        acc = InputAccordion(value, label=label)
+        return acc, acc
+    except Exception:
+        cb = gr.Checkbox(value=value, label=label)
+        return gr.Accordion(label=label, open=True), cb
+
+
+def _sv_default_choice():
+    """The LoRA to preselect when the Seed Variance section is enabled and
+    nothing is chosen yet: the first priority-sorted match, if any."""
+    for name in _sv_lora_choices():
+        if name != "None" and core.sv_is_priority(name):
+            return name
+    return "None"
+
+
 def _builtin_ctl_mapping():
     """Forge >= c2ae52e5 ships 'LoRA Control Integrated' (prompt syntax
     <lora:name:[a:b]>), which drives patch strengths per step itself. Its
@@ -379,63 +402,89 @@ class NeoLoraCtlScript(scripts.Script):
             gr.Markdown("Focuses prompt-loaded `<lora:...>` networks on what you "
                         "want from them: pick **where** in the model (blocks) and "
                         "**when** in the run (timesteps) each LoRA applies.")
-            gr.Markdown("**Blocks** — what the LoRA is allowed to shape")
-            with gr.Row():
-                block_preset = gr.Dropdown(choices=list(core.BLOCK_PRESETS), value="FULL",
-                                           label="Block preset")
-                block_modifier = gr.Radio(choices=list(core.MODIFIERS), value="Emphasize",
-                                          label="Modifier")
-                block_contrast = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Contrast")
-                block_boost = gr.Slider(0.25, 2.0, value=1.0, step=0.05,
-                                        label="Boost (Emphasize)")
-            gr.Markdown("**Timesteps** — when in the run the LoRA applies")
-            with gr.Row():
-                time_preset = gr.Dropdown(choices=list(core.TIME_PRESETS), value="FLAT",
-                                          label="Timestep preset")
-                time_modifier = gr.Radio(choices=list(core.MODIFIERS), value="Emphasize",
-                                         label="Modifier")
-                time_contrast = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Contrast")
-                time_boost = gr.Slider(0.25, 2.0, value=1.0, step=0.05,
-                                       label="Boost (Emphasize)")
-            gr.Markdown("**Seed Variance** — a helper LoRA applied only during the "
-                        "composition steps, to diversify results across seeds")
-            with gr.Row():
-                sv_lora = gr.Dropdown(choices=_sv_lora_choices(), value="None",
-                                      label="Seed variance LoRA")
-                sv_strength = gr.Slider(0.0, 2.0, value=1.0, step=0.05,
-                                        label="Strength")
-                sv_te = gr.Checkbox(label="Apply its text encoder", value=False)
-            te_enabled = gr.Checkbox(
-                label="Apply text-encoder half of scheduled LoRAs (at prompt strength)",
-                value=True)
-            with gr.Row():
-                filter_mode = gr.Radio(choices=["exclude", "include"], value="exclude",
-                                       label="Filter mode")
-                filter_patterns = gr.Textbox(
-                    value=core.DEFAULT_EXCLUDE_PATTERNS, label="Filter patterns",
-                    placeholder="comma-separated name substrings")
-            gr.Markdown("*Accelerator LoRAs (turbo/lightning/...) must stay excluded — "
-                        "scheduling them breaks distilled checkpoints.*")
-            compile_bake = gr.Checkbox(
-                label="Compile (bake static LoRA schedules into the weights for "
-                      "full-speed generation)", value=True)
-            debug = gr.Checkbox(label="Debug logging", value=False)
-            with gr.Row(visible=DEV_MODE):
-                dev_mask = gr.Textbox(value="", label="DEV: explicit block mask",
-                                      placeholder="one value per block, comma-separated")
-                dev_bounds = gr.Textbox(value="", label="DEV: time boundaries hi,lo",
-                                        placeholder=f"{core.DEFAULT_TIME_HI_BOUNDARY},"
-                                                    f"{core.DEFAULT_TIME_LO_BOUNDARY}")
-        return [enabled, block_preset, block_modifier, block_contrast, block_boost,
-                time_preset, time_modifier, time_contrast, time_boost,
-                sv_lora, sv_strength, sv_te,
+
+            blocks_ctx, blocks_enabled = _input_accordion(
+                False, "Blocks — what the LoRA is allowed to shape")
+            with blocks_ctx:
+                with gr.Row():
+                    block_preset = gr.Dropdown(choices=list(core.BLOCK_PRESETS),
+                                               value="CHARACTER", label="Block preset")
+                    block_modifier = gr.Radio(choices=list(core.MODIFIERS),
+                                              value="Emphasize", label="Modifier")
+                    block_contrast = gr.Slider(0.0, 1.0, value=0.5, step=0.05,
+                                               label="Contrast")
+                    block_boost = gr.Slider(0.25, 2.0, value=1.0, step=0.05,
+                                            label="Boost (Emphasize)")
+
+            time_ctx, time_enabled = _input_accordion(
+                False, "Timesteps — when in the run the LoRA applies")
+            with time_ctx:
+                with gr.Row():
+                    time_preset = gr.Dropdown(choices=list(core.TIME_PRESETS),
+                                              value="COMPOSITION", label="Timestep preset")
+                    time_modifier = gr.Radio(choices=list(core.MODIFIERS),
+                                             value="Emphasize", label="Modifier")
+                    time_contrast = gr.Slider(0.0, 1.0, value=0.5, step=0.05,
+                                              label="Contrast")
+                    time_boost = gr.Slider(0.25, 2.0, value=1.0, step=0.05,
+                                           label="Boost (Emphasize)")
+
+            sv_ctx, sv_enabled = _input_accordion(
+                False, "Seed Variance — diversify results across seeds")
+            with sv_ctx:
+                gr.Markdown("A helper LoRA applied only during the composition "
+                            "steps, then switched off.")
+                with gr.Row():
+                    sv_lora = gr.Dropdown(choices=_sv_lora_choices(), value="None",
+                                          label="Seed variance LoRA")
+                    sv_strength = gr.Slider(0.0, 2.0, value=1.0, step=0.05,
+                                            label="Strength")
+                    sv_te = gr.Checkbox(label="Apply its text encoder", value=False)
+
+            with gr.Accordion("Advanced", open=False):
+                te_enabled = gr.Checkbox(
+                    label="Apply text-encoder half of scheduled LoRAs (at prompt strength)",
+                    value=True)
+                with gr.Row():
+                    filter_mode = gr.Radio(choices=["exclude", "include"], value="exclude",
+                                           label="Filter mode")
+                    filter_patterns = gr.Textbox(
+                        value=core.DEFAULT_EXCLUDE_PATTERNS, label="Filter patterns",
+                        placeholder="comma-separated name substrings")
+                gr.Markdown("*Accelerator LoRAs (turbo/lightning/...) must stay "
+                            "excluded — scheduling them breaks distilled checkpoints.*")
+                compile_bake = gr.Checkbox(
+                    label="Compile (bake static LoRA schedules into the weights for "
+                          "full-speed generation)", value=True)
+                debug = gr.Checkbox(label="Debug logging", value=False)
+                with gr.Row(visible=DEV_MODE):
+                    dev_mask = gr.Textbox(value="", label="DEV: explicit block mask",
+                                          placeholder="one value per block, comma-separated")
+                    dev_bounds = gr.Textbox(value="", label="DEV: time boundaries hi,lo",
+                                            placeholder=f"{core.DEFAULT_TIME_HI_BOUNDARY},"
+                                                        f"{core.DEFAULT_TIME_LO_BOUNDARY}")
+
+            try:
+                def _preselect(checked, current):
+                    if checked and current in (None, "", "None"):
+                        return gr.update(value=_sv_default_choice())
+                    return gr.update()
+                sv_enabled.change(fn=_preselect, inputs=[sv_enabled, sv_lora],
+                                  outputs=[sv_lora], show_progress="hidden")
+            except Exception:
+                pass  # fallback shim or offline harness without event support
+
+        return [enabled, blocks_enabled, block_preset, block_modifier, block_contrast,
+                block_boost, time_enabled, time_preset, time_modifier, time_contrast,
+                time_boost, sv_enabled, sv_lora, sv_strength, sv_te,
                 te_enabled, filter_mode, filter_patterns, compile_bake,
                 debug, dev_mask, dev_bounds]
 
-    def process(self, p, enabled=False, block_preset="FULL", block_modifier="Emphasize",
-                block_contrast=0.7, block_boost=1.0, time_preset="FLAT",
+    def process(self, p, enabled=False, blocks_enabled=False, block_preset="FULL",
+                block_modifier="Emphasize", block_contrast=0.7, block_boost=1.0,
+                time_enabled=False, time_preset="FLAT",
                 time_modifier="Emphasize", time_contrast=0.7, time_boost=1.0,
-                sv_lora="None", sv_strength=1.0, sv_te=False,
+                sv_enabled=False, sv_lora="None", sv_strength=1.0, sv_te=False,
                 te_enabled=True, filter_mode="exclude",
                 filter_patterns="", compile_bake=True,
                 debug=False, dev_mask="", dev_bounds="", *args):
@@ -451,6 +500,15 @@ class NeoLoraCtlScript(scripts.Script):
         cls.captured_schedule = []
         if not cls.enabled:
             return
+
+        # Section checkboxes gate their axes; XYZ overrides below still win,
+        # so grid sweeps work regardless of the checkbox state.
+        if not blocks_enabled:
+            block_preset = "FULL"
+        if not time_enabled:
+            time_preset = "FLAT"
+        if not sv_enabled:
+            sv_lora = "None"
 
         # XYZ grid overrides (apply_field sets these on the per-cell p).
         block_preset = getattr(p, "loractl_xyz_block_preset", block_preset)
