@@ -186,7 +186,10 @@ def _fake_networks(tuple_len=5):
     def load_lora_for_models(model, clip, lora, strength_model, strength_clip,
                              filename="default", online_mode=False):
         networks.calls.append({"filename": filename, "online_mode": online_mode,
-                               "strength_clip": strength_clip})
+                               "strength_clip": strength_clip,
+                               "model": model is not None, "clip": clip is not None})
+        if model is None:
+            return None, clip  # TE-only application
         new_model = model.clone()
         new_model.add_patches(LORA_KEYS[os.path.basename(filename)], strength_model,
                               online_mode, tuple_len=tuple_len, filename=filename)
@@ -201,9 +204,13 @@ def _fake_networks(tuple_len=5):
 
 
 class FakeForgeObjects:
-    def __init__(self, unet):
+    def __init__(self, unet, clip=None):
         self.unet = unet
-        self.clip = object()
+        self.clip = clip if clip is not None else object()
+
+    def shallow_copy(self):
+        # Forge: new container, SAME unet/clip objects.
+        return FakeForgeObjects(self.unet, self.clip)
 
 
 class FakeSDModel:
@@ -211,6 +218,7 @@ class FakeSDModel:
         self.current_lora_hash = None
         self.forge_objects = FakeForgeObjects(FakePatcher())
         self.forge_objects_original = FakeForgeObjects(FakePatcher())
+        self.forge_objects_after_applying_lora = self.forge_objects.shallow_copy()
 
 
 class FakeSampler:
@@ -290,6 +298,9 @@ class Harness:
                 self.sd_model.forge_objects.unet, object(), {}, s, s, filename=f)
             if result is not None:
                 self.sd_model.forge_objects.unet = result[0]
+        # load_networks takes the post-LoRA snapshot at the end of a reload.
+        self.sd_model.forge_objects_after_applying_lora = \
+            self.sd_model.forge_objects.shallow_copy()
 
     def generate(self, lora_files, strengths=None, ui=None, steps_schedule=KREA_SCHEDULE,
                  p_attrs=None, batches=1, stop_after=None):
@@ -306,7 +317,13 @@ class Harness:
         for _ in range(batches):
             s.before_process_batch(p)
             self.activate(p, lora_files, strengths)
+            # processing.py:972 — reset before process_batch
+            self.sd_model.forge_objects = \
+                self.sd_model.forge_objects_after_applying_lora.shallow_copy()
             s.process_batch(p)
+            # processing.py:1376 — reset again inside sample(), per pass
+            self.sd_model.forge_objects = \
+                self.sd_model.forge_objects_after_applying_lora.shallow_copy()
             s.process_before_every_sampling(p)
             self.fake_load()
             sigmas = p.sampler.get_sigmas(p, len(steps_schedule) - 1)
@@ -915,11 +932,21 @@ class TestSeedVariance(unittest.TestCase):
         h.generate(["krea_turbo.safetensors"], strengths=[0.5],
                    ui=dict(self.UI, sv_te=True))
         sv_calls = [c for c in h.networks.calls if c["filename"] == SV_FILE]
-        self.assertEqual(len(sv_calls), 1)
-        self.assertEqual(sv_calls[0]["strength_clip"], 1.0)
+        # Split application: TE-only in process_batch (before conds), then
+        # unet-only in process_before_every_sampling (after Forge's reset).
+        self.assertEqual(len(sv_calls), 2)
+        te_call, unet_call = sv_calls
+        self.assertFalse(te_call["model"])
+        self.assertTrue(te_call["clip"])
+        self.assertEqual(te_call["strength_clip"], 1.0)
+        self.assertTrue(unet_call["model"])
+        self.assertFalse(unet_call["clip"])
+        self.assertEqual(unet_call["strength_clip"], 0.0)
         h2 = Harness()
         h2.generate(["krea_turbo.safetensors"], strengths=[0.5], ui=self.UI)
         sv_calls = [c for c in h2.networks.calls if c["filename"] == SV_FILE]
+        self.assertEqual(len(sv_calls), 1)  # TE off: unet-only
+        self.assertTrue(sv_calls[0]["model"])
         self.assertEqual(sv_calls[0]["strength_clip"], 0.0)
 
     def test_infotext(self):

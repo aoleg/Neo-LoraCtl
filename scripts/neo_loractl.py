@@ -256,6 +256,8 @@ class NeoLoraCtlScript(scripts.Script):
     sv_handle = None                 # core.BakedLoraHandle | None
     sv_debaked: bool = False
     sv_warned_collision: bool = False
+    sv_batch_applied: bool = False
+    sv_sd = None                     # cached state dict (path, dict), per job
 
     # --- compile-mode bookkeeping ---
     baked_files: list = []
@@ -540,6 +542,7 @@ class NeoLoraCtlScript(scripts.Script):
         cls = NeoLoraCtlScript
         cls.cycle_open = False
         cls.prompt_cycle_open = False
+        cls.sv_batch_applied = False
 
         baked = cls.enabled and cls.baked_mode_active()
         sv_sig = ((cls.sv_path, cls.sv_strength, cls.sv_te)
@@ -595,48 +598,76 @@ class NeoLoraCtlScript(scripts.Script):
     # ------------------------------------------------------------------
 
     @classmethod
-    def sv_apply(cls, p):
+    def sv_active(cls):
+        """Enabled, resolved, and not colliding with a prompt instance."""
         if not cls.enabled or cls.sv_path is None:
-            return
-        unet = getattr(getattr(getattr(p, "sd_model", None), "forge_objects", None), "unet", None)
-        patches = getattr(unet, "patches", None)
-        if unet is None or patches is None:
-            return
+            return False
         sv_norm = os.path.normcase(os.path.normpath(cls.sv_path))
         if any(os.path.normcase(os.path.normpath(f)) == sv_norm for f in cls.prompt_files):
             if not cls.sv_warned_collision:
                 cls.sv_warned_collision = True
                 _log("seed variance LoRA is also in the prompt; the prompt "
                      "instance wins, section skipped")
-            return
-        if cls.sv_handle is not None and cls.sv_handle.present_in(patches):
-            if cls.sv_debaked:
-                # Next batch of the same job: bring the X phase back.
-                affected = cls.sv_handle.set_strength(patches, cls.sv_strength)
-                n = _rebake_keys(unet, affected)
-                cls.sv_debaked = False
-                if cls.debug:
-                    _log(f"seed variance re-baked at {cls.sv_strength:g} ({n} keys)")
-            return
-        cls.sv_handle = None
-        cls.sv_debaked = False
+            return False
+        return True
+
+    @classmethod
+    def _sv_state_dict(cls):
+        if cls.sv_sd is not None and cls.sv_sd[0] == cls.sv_path:
+            return cls.sv_sd[1]
         try:
             import networks
             sd = networks.load_lora_state_dict(cls.sv_path)
         except Exception as e:
             _log(f"ERROR: cannot load seed variance LoRA: {e}")
             cls.sv_path = None
+            return None
+        cls.sv_sd = (cls.sv_path, sd)
+        return sd
+
+    @classmethod
+    def sv_apply_te(cls, p):
+        """TE half, applied in process_batch: the conditioning is encoded
+        after this hook, and Forge's pre-sampling forge_objects reset does
+        not undo an encoding that already happened."""
+        if not cls.sv_active() or not cls.sv_te:
             return
-        clip = p.sd_model.forge_objects.clip if cls.sv_te else None
+        sd = cls._sv_state_dict()
+        if sd is None:
+            return
+        clip = p.sd_model.forge_objects.clip
+        result = _original_load_lora_for_models(
+            None, clip, sd, 0.0, cls.sv_strength, cls.sv_path, False)
+        if result is not None and result[1] is not None:
+            p.sd_model.forge_objects.clip = result[1]
+            if cls.debug:
+                _log(f"seed variance TE applied at {cls.sv_strength:g}")
+
+    @classmethod
+    def sv_apply(cls, p):
+        """UNet half, applied in process_before_every_sampling: Forge resets
+        forge_objects from the post-LoRA snapshot inside sample()
+        (processing.py:1376), so anything attached earlier is discarded.
+        Applied once per batch; the hires pass runs on a fresh reset copy
+        and is deliberately left without the SV LoRA."""
+        if not cls.sv_active() or cls.sv_batch_applied:
+            return
+        unet = getattr(getattr(getattr(p, "sd_model", None), "forge_objects", None), "unet", None)
+        patches = getattr(unet, "patches", None)
+        if unet is None or patches is None:
+            return
+        cls.sv_handle = None
+        cls.sv_debaked = False
+        sd = cls._sv_state_dict()
+        if sd is None:
+            return
         before = core.ScheduleSet.snapshot_counts(patches)
         result = _original_load_lora_for_models(
-            unet, clip, sd, cls.sv_strength,
-            cls.sv_strength if cls.sv_te else 0.0, cls.sv_path, False)
-        del sd
+            unet, None, sd, cls.sv_strength, 0.0, cls.sv_path, False)
         if result is None:
             _log("ERROR: seed variance LoRA failed to load")
             return
-        new_unet, new_clip = result
+        new_unet = result[0]
         handle, errors = core.BakedLoraHandle.collect(
             before, getattr(new_unet, "patches", {}), cls.sv_strength)
         if handle is None or not handle.entries:
@@ -645,9 +676,8 @@ class NeoLoraCtlScript(scripts.Script):
                     " (no patches matched this model)"))
             return  # new_unet not adopted; behavior stays unchanged
         p.sd_model.forge_objects.unet = new_unet
-        if cls.sv_te and new_clip is not None:
-            p.sd_model.forge_objects.clip = new_clip
         cls.sv_handle = handle
+        cls.sv_batch_applied = True
         if cls.debug:
             _log(f"seed variance '{os.path.basename(cls.sv_path)}' baked at "
                  f"{cls.sv_strength:g} ({len(handle.entries)} patches); switches "
@@ -663,6 +693,7 @@ class NeoLoraCtlScript(scripts.Script):
         if unet is None or patches is None or not handle.present_in(patches):
             cls.sv_handle = None
             cls.sv_debaked = False
+            cls.sv_sd = None
             return
         if not cls.sv_debaked:
             # Interrupted before the boundary: restore now, unconditionally.
@@ -676,6 +707,7 @@ class NeoLoraCtlScript(scripts.Script):
                 freed += 1
         cls.sv_handle = None
         cls.sv_debaked = False
+        cls.sv_sd = None
         if cls.debug:
             _log(f"seed variance cleaned up ({len(our_keys)} keys, "
                  f"{freed} exclusive backups freed)")
@@ -684,7 +716,7 @@ class NeoLoraCtlScript(scripts.Script):
         cls = NeoLoraCtlScript
         cls.cycle_open = False
         cls.prompt_cycle_open = False
-        cls.sv_apply(p)
+        cls.sv_apply_te(p)
         if cls.enabled and cls.debug and cls.baked_files:
             _log(f"compiled (full speed): {cls.baked_files}")
         if cls.enabled and cls.debug:
@@ -698,6 +730,7 @@ class NeoLoraCtlScript(scripts.Script):
         cls = NeoLoraCtlScript
         if not cls.enabled:
             return
+        cls.sv_apply(p)
         sampler = getattr(p, "sampler", None)
         original = getattr(sampler, "get_sigmas", None)
         if sampler is None or not callable(original):
