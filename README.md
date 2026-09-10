@@ -82,7 +82,7 @@ Pick it in the Seed variance LoRA dropdown (LoRAs whose names look like seed var
 
 Do not add this LoRA to your prompt as well: the dropdown is the whole interface for it, and if it also appears in the prompt the section steps aside and tells you so in the console.
 
-The "Apply its text encoder" checkbox controls whether the adapter's text encoder half is used. It is off by default; the text encoder applies to the whole run by nature, which works against a composition-only adapter, but the checkbox is there so you can compare both ways.
+The "Apply its text encoder" checkbox controls whether the adapter's text encoder half is used. It is off by default; the text encoder applies to the whole run by nature, which works against a composition-only adapter, but the checkbox is there so you can compare both ways. Note that many such adapters, the krea2-turbo-sda among them, contain no text encoder weights at all; the checkbox then does nothing, and the console says so.
 
 ## Compile
 

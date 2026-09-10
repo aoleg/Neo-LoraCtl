@@ -257,7 +257,9 @@ class NeoLoraCtlScript(scripts.Script):
     sv_debaked: bool = False
     sv_warned_collision: bool = False
     sv_batch_applied: bool = False
+    sv_te_noop_logged: bool = False
     sv_sd = None                     # cached state dict (path, dict), per job
+    last_enc_sig = None              # encoding-affecting config, for cond-cache busts
 
     # --- compile-mode bookkeeping ---
     baked_files: list = []
@@ -469,6 +471,7 @@ class NeoLoraCtlScript(scripts.Script):
         cls.sv_strength = float(sv_strength)
         cls.sv_te = bool(sv_te)
         cls.sv_warned_collision = False
+        cls.sv_te_noop_logged = False
         sv_name = str(sv_lora)
         cls.sv_path = _sv_resolve_path(sv_name)
         if sv_name not in ("", "None") and cls.sv_path is None:
@@ -497,6 +500,20 @@ class NeoLoraCtlScript(scripts.Script):
             boost=float(time_boost),
             hi_boundary=hi, lo_boundary=lo,
         )
+
+        enc_sig = (cls.te_enabled,
+                   (cls.sv_path, cls.sv_strength) if (cls.sv_te and cls.sv_path) else None)
+        if enc_sig != cls.last_enc_sig:
+            cls.last_enc_sig = enc_sig
+            invalidated = 0
+            for cache in (getattr(p, "cached_c", None), getattr(p, "cached_uc", None),
+                          getattr(p, "cached_hr_c", None), getattr(p, "cached_hr_uc", None)):
+                if isinstance(cache, list) and cache and cache[0] is not None:
+                    cache[0] = None
+                    invalidated += 1
+            if invalidated and cls.debug:
+                _log(f"text-encoder config changed; invalidated {invalidated} "
+                     "conditioning cache(s)")
 
         block_sig = (str(block_preset), str(block_modifier), float(block_contrast),
                      float(block_boost), str(dev_mask))
@@ -638,10 +655,15 @@ class NeoLoraCtlScript(scripts.Script):
         clip = p.sd_model.forge_objects.clip
         result = _original_load_lora_for_models(
             None, clip, sd, 0.0, cls.sv_strength, cls.sv_path, False)
-        if result is not None and result[1] is not None:
-            p.sd_model.forge_objects.clip = result[1]
+        new_clip = result[1] if result is not None else None
+        if new_clip is not None and new_clip is not clip:
+            p.sd_model.forge_objects.clip = new_clip
             if cls.debug:
                 _log(f"seed variance TE applied at {cls.sv_strength:g}")
+        elif not cls.sv_te_noop_logged:
+            cls.sv_te_noop_logged = True
+            _log(f"'{os.path.basename(cls.sv_path)}' has no text-encoder "
+                 "component; the TE checkbox has no effect for this LoRA")
 
     @classmethod
     def sv_apply(cls, p):

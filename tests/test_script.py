@@ -957,6 +957,40 @@ class TestSeedVariance(unittest.TestCase):
         self.assertEqual(p.extra_generation_params["LoraCtl mode"], "online")
 
 
+class TestCondCacheInvalidation(unittest.TestCase):
+    def _p_with_caches(self, h):
+        return {"cached_c": [("old",), "val"], "cached_uc": [("old",), "val"],
+                "cached_hr_c": [("old",), "val"], "cached_hr_uc": [("old",), "val"]}
+
+    def test_te_toggle_busts_cond_cache(self):
+        h = Harness()
+        caches = self._p_with_caches(h)
+        h.generate(["charA.safetensors"], p_attrs=dict(caches))
+        # First run establishes the signature; caches may or may not be hit.
+        caches2 = self._p_with_caches(h)
+        h.generate(["charA.safetensors"], ui={"te_enabled": False},
+                   p_attrs=dict(caches2))
+        for name in ("cached_c", "cached_uc", "cached_hr_c", "cached_hr_uc"):
+            self.assertIsNone(caches2[name][0], name)
+
+    def test_unchanged_config_keeps_cache(self):
+        h = Harness()
+        h.generate(["charA.safetensors"])
+        caches = self._p_with_caches(h)
+        h.generate(["charA.safetensors"], p_attrs=dict(caches))
+        for name in ("cached_c", "cached_uc"):
+            self.assertIsNotNone(caches[name][0], name)
+
+    def test_sv_te_missing_component_logged_and_clip_untouched(self):
+        h = Harness()
+        clip_before = h.sd_model.forge_objects_after_applying_lora.clip
+        h.generate(["krea_turbo.safetensors"], strengths=[0.5],
+                   ui={"sv_lora": SV_ALIAS, "sv_strength": 1.0, "sv_te": True})
+        self.assertTrue(h.cls().sv_te_noop_logged)
+        # Fake loader returns the same clip object (no TE keys): not adopted.
+        self.assertIs(h.sd_model.forge_objects.clip, clip_before)
+
+
 class TestSvSorting(unittest.TestCase):
     def test_priority_names_first(self):
         names = ["zeta_style", "krea2_turbo_sda_v1.0", "alpha_char", "my-sda-v2",
