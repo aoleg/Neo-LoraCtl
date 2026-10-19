@@ -1073,7 +1073,9 @@ def _fake_rebake_backend(set_funcs=None):
 
     def set_attr(model, key, value):
         obj, name = resolve(model, key)
-        setattr(obj, name, torch.nn.Parameter(value, requires_grad=False))
+        if isinstance(value, torch.Tensor):
+            value = torch.nn.Parameter(value, requires_grad=False)
+        setattr(obj, name, value)
 
     def copy_to_param(model, key, value):
         obj, name = resolve(model, key)
@@ -1104,6 +1106,21 @@ def _fake_rebake_backend(set_funcs=None):
     stubs["backend"].memory_management = stubs["backend.memory_management"]
     stubs["backend"].utils = stubs["backend.utils"]
     return stubs, emptied
+
+class _FakeQuantized:
+    """A wrapper subclass the way comfy_kitchen's QuantizedTensor flattens:
+    inner data and scale tensors plus layout metadata."""
+
+    def __init__(self, qdata, scale, layout="int8"):
+        self._qdata, self.scale, self.layout = qdata, scale, layout
+        self.device = qdata.device
+
+    def __tensor_flatten__(self):
+        self._param_scale = self.scale
+        return ["_qdata", "_param_scale"], {"layout": self.layout}
+
+    def tolist(self):
+        return self._qdata.tolist(), self.scale.tolist()
 
 
 @unittest.skipIf(torch is None, "needs torch")
@@ -1187,17 +1204,61 @@ class TestRebakeKeysMemory(unittest.TestCase):
         self.assertEqual(backup.tolist(), [1.0, 2.0])
         self.assertEqual(patcher.model.a.weight.tolist(), [3.0, 6.0])
 
-    def test_set_func_path_unchanged(self):
+    def test_set_func_result_copied_into_the_live_weight(self):
         calls = []
         live = self._plain([9.0, 9.0])
         patcher = self._patcher(live, torch.tensor([1.0, 2.0], dtype=torch.bfloat16),
                                 [(1.0, torch.tensor([2.0, 4.0]))], inplace_update=True)
 
-        def set_func(out, inplace_update, seed):
-            calls.append((out.tolist(), inplace_update))
+        def set_func(out, inplace_update, seed, return_weight=False):
+            calls.append((out.tolist(), inplace_update, return_weight))
+            return out.to(torch.bfloat16)
 
         self.assertEqual(self._rebake(patcher, {"a.weight": set_func}), [True])
-        self.assertEqual(calls, [([3.0, 6.0], True)])
+        self.assertEqual(calls, [([3.0, 6.0], True, True)])
+        self.assertIs(patcher.model.a.weight, live)
+        self.assertEqual(live.tolist(), [3.0, 6.0])
+
+    def _quant(self, values, scale, layout="int8"):
+        return _FakeQuantized(torch.tensor(values, dtype=torch.int8),
+                              torch.tensor([scale]), layout)
+
+    def test_quantized_restore_copied_into_the_live_tensors(self):
+        live = self._quant([9, 9], 2.0)
+        ptrs = (live._qdata.data_ptr(), live.scale.data_ptr())
+        backup = self._quant([1, 2], 0.5)
+        patcher = self._patcher(live, backup, [(0.0, None)])
+        self.assertEqual(self._rebake(patcher), [True])
+        self.assertIs(patcher.model.a.weight, live)
+        self.assertEqual((live._qdata.data_ptr(), live.scale.data_ptr()), ptrs)
+        self.assertEqual(live.tolist(), ([1, 2], [0.5]))
+        self.assertEqual(backup.tolist(), ([1, 2], [0.5]))
+
+    def test_requantized_weight_copied_into_the_live_tensors(self):
+        live = self._quant([9, 9], 2.0)
+        ptr = live._qdata.data_ptr()
+        patcher = self._patcher(live, torch.tensor([1.0, 2.0], dtype=torch.bfloat16),
+                                [(1.0, torch.tensor([2.0, 4.0]))])
+        calls = []
+
+        def set_func(out, inplace_update, seed, return_weight=False):
+            calls.append(return_weight)
+            return self._quant([int(v) for v in out.tolist()], 0.25)
+
+        self.assertEqual(self._rebake(patcher, {"a.weight": set_func}), [True])
+        self.assertEqual(calls, [True])
+        self.assertIs(patcher.model.a.weight, live)
+        self.assertEqual(live._qdata.data_ptr(), ptr)
+        self.assertEqual(live.tolist(), ([3, 6], [0.25]))
+
+    def test_requantized_weight_with_other_layout_is_stored_as_returned(self):
+        live = self._quant([9, 9], 2.0)
+        patcher = self._patcher(live, torch.tensor([1.0, 2.0], dtype=torch.bfloat16),
+                                [(1.0, torch.tensor([2.0, 4.0]))])
+        new = self._quant([3, 6], 0.25, layout="fp8")
+        self._rebake(patcher, {"a.weight": lambda out, inplace_update, seed, return_weight=False: new})
+        self.assertIs(patcher.model.a.weight, new)
+        self.assertEqual(live.tolist(), ([9, 9], [2.0]))
 
 
 if __name__ == "__main__":
