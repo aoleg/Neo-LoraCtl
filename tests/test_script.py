@@ -1051,5 +1051,154 @@ class TestSvSorting(unittest.TestCase):
         self.assertNotIn("sdapp_tool", ordered[:2])  # sda not delimited
 
 
+try:
+    import torch
+except ImportError:
+    torch = None
+
+
+def _fake_rebake_backend(set_funcs=None):
+    """Stub the backend modules the real _rebake_keys imports, with Forge's
+    own set_attr / copy_to_param semantics (backend/utils.py) and a merge
+    that adds ``strength * delta`` per payload. Returns (stubs, emptied)."""
+    emptied = []
+    set_funcs = set_funcs or {}
+
+    def resolve(model, key):
+        obj = model
+        *path, name = key.split(".")
+        for part in path:
+            obj = getattr(obj, part)
+        return obj, name
+
+    def set_attr(model, key, value):
+        obj, name = resolve(model, key)
+        setattr(obj, name, torch.nn.Parameter(value, requires_grad=False))
+
+    def copy_to_param(model, key, value):
+        obj, name = resolve(model, key)
+        getattr(obj, name).data.copy_(value)
+
+    def get_key_weight(model, key):
+        obj, name = resolve(model, key)
+        return getattr(obj, name), set_funcs.get(key), None
+
+    def merge(patches, weight, key):
+        for strength, delta, *_ in patches:
+            weight += strength * delta
+        return weight
+
+    ns = types.SimpleNamespace
+    stubs = {
+        "backend": types.ModuleType("backend"),
+        "backend.memory_management": ns(
+            lora_compute_dtype=lambda device: torch.float32,
+            cast_to_device=lambda t, device, dtype, copy=False: t.to(device, dtype, copy=copy),
+            soft_empty_cache=lambda: emptied.append(True)),
+        "backend.utils": ns(set_attr=set_attr, copy_to_param=copy_to_param),
+        "backend.float": ns(stochastic_rounding=lambda v, dtype, seed=0: v.to(dtype)),
+        "backend.patcher": types.ModuleType("backend.patcher"),
+        "backend.patcher.base": ns(get_key_weight=get_key_weight),
+        "backend.patcher.lora": ns(merge_lora_to_weight=merge, string_to_seed=lambda key: 0),
+    }
+    stubs["backend"].memory_management = stubs["backend.memory_management"]
+    stubs["backend"].utils = stubs["backend.utils"]
+    return stubs, emptied
+
+
+@unittest.skipIf(torch is None, "needs torch")
+class TestRebakeKeysMemory(unittest.TestCase):
+    """The real _rebake_keys: results go into the live weight's own memory
+    where they fit, and the merge temporaries go back to the driver."""
+
+    def setUp(self):
+        self.mod = _load_script(_fake_networks())
+
+    def _rebake(self, patcher, set_funcs=None):
+        stubs, emptied = _fake_rebake_backend(set_funcs)
+        saved = {k: sys.modules.get(k) for k in stubs}
+        sys.modules.update(stubs)
+        try:
+            self.mod._rebake_keys(patcher, ["a.weight"])
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+        return emptied
+
+    def _patcher(self, live, backup, patches, inplace_update=False):
+        import collections
+        dimension = collections.namedtuple("Dimension", ["weight", "inplace_update"])
+        model = torch.nn.Module()
+        model.a = torch.nn.Module()
+        model.a.weight = live
+        return types.SimpleNamespace(
+            model=model, backup={"a.weight": dimension(backup, inplace_update)},
+            patches={"a.weight": patches})
+
+    def _plain(self, values, dtype=None):
+        return torch.nn.Parameter(torch.tensor(values, dtype=dtype or torch.bfloat16),
+                                  requires_grad=False)
+
+    def test_merge_written_into_the_live_weight(self):
+        live = self._plain([9.0, 9.0])
+        ptr = live.data_ptr()
+        patcher = self._patcher(live, torch.tensor([1.0, 2.0], dtype=torch.bfloat16),
+                                [(0.5, torch.tensor([2.0, 4.0]))])
+        self.assertEqual(self._rebake(patcher), [True])
+        self.assertIs(patcher.model.a.weight, live)
+        self.assertEqual(live.data_ptr(), ptr)
+        self.assertEqual(live.tolist(), [2.0, 4.0])
+
+    def test_restore_copied_from_the_backup_into_the_live_weight(self):
+        live = self._plain([9.0, 9.0])
+        backup = torch.tensor([1.0, 2.0], dtype=torch.bfloat16)
+        patcher = self._patcher(live, backup, [(0.0, torch.tensor([2.0, 4.0]))])
+        self.assertEqual(self._rebake(patcher), [True])
+        self.assertIs(patcher.model.a.weight, live)
+        self.assertEqual(live.tolist(), [1.0, 2.0])
+        self.assertIs(patcher.backup["a.weight"].weight, backup)
+
+    def test_mismatched_or_quantized_weights_keep_set_attr(self):
+        class QuantTensor(torch.Tensor):
+            pass
+
+        backup = torch.tensor([1, 2], dtype=torch.int8)     # raw quantized original
+        cases = {
+            "dtype": self._plain([9.0, 9.0]),
+            "shape": torch.nn.Parameter(torch.zeros(3, dtype=torch.int8), requires_grad=False),
+            "subclass": torch.zeros(2, dtype=torch.int8).as_subclass(QuantTensor),
+        }
+        for name, live in cases.items():
+            with self.subTest(name):
+                patcher = self._patcher(live, backup, [(0.0, None)])
+                self._rebake(patcher)
+                self.assertIsNot(patcher.model.a.weight, live)
+                self.assertEqual(patcher.model.a.weight.tolist(), [1, 2])
+                self.assertNotEqual(patcher.model.a.weight.data_ptr(), backup.data_ptr())
+
+    def test_live_weight_sharing_the_backup_storage_is_not_written(self):
+        backup = torch.tensor([1.0, 2.0], dtype=torch.bfloat16)
+        live = torch.nn.Parameter(backup, requires_grad=False)
+        patcher = self._patcher(live, backup, [(1.0, torch.tensor([2.0, 4.0]))])
+        self._rebake(patcher)
+        self.assertEqual(backup.tolist(), [1.0, 2.0])
+        self.assertEqual(patcher.model.a.weight.tolist(), [3.0, 6.0])
+
+    def test_set_func_path_unchanged(self):
+        calls = []
+        live = self._plain([9.0, 9.0])
+        patcher = self._patcher(live, torch.tensor([1.0, 2.0], dtype=torch.bfloat16),
+                                [(1.0, torch.tensor([2.0, 4.0]))], inplace_update=True)
+
+        def set_func(out, inplace_update, seed):
+            calls.append((out.tolist(), inplace_update))
+
+        self.assertEqual(self._rebake(patcher, {"a.weight": set_func}), [True])
+        self.assertEqual(calls, [([3.0, 6.0], True)])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
